@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>合同付款信息提取 - 可视化</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>合同付款信息提取 · 可视化</h1>
+    <p class="subtitle">上传 MD 合同 → 选择合同类型 → 分步查看 Service 1 / Service 2 结果</p>
+    {% if service2_mode %}
+    <div class="mode-badge" title="{{ service2_base_url }}">
+      Service 2:
+      <span class="mode-{{ service2_mode }}">{{ '本地' if service2_mode == 'local' else '百舸远程' }}</span>
+      <code>{{ service2_base_url }}</code>
+    </div>
+    {% endif %}
+  </header>
+
+  <main class="container">
+    <!-- 上传表单 -->
+    <section class="card" id="upload-card">
+      <h2>① 上传合同</h2>
+      <form id="upload-form">
+        <div class="field">
+          <label for="file">合同文件（.md）</label>
+          <input type="file" id="file" name="file" accept=".md,text/markdown" required />
+        </div>
+
+        <div class="field">
+          <label>合同类型（将覆盖付款条款分类）</label>
+          <div class="radio-group">
+            <label class="radio">
+              <input type="radio" name="contract_type" value="installation" />
+              <span>安装合同</span>
+              <small>付款条款 → 安装付款条款</small>
+            </label>
+            <label class="radio">
+              <input type="radio" name="contract_type" value="equipment" />
+              <span>设备合同</span>
+              <small>付款条款 → 设备付款条款</small>
+            </label>
+            <label class="radio">
+              <input type="radio" name="contract_type" value="mixed" checked />
+              <span>混签合同</span>
+              <small>付款条款 → 混签付款条款</small>
+            </label>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>处理参数（可选，留空使用默认值）</label>
+          <div class="param-group">
+            <div class="param-item">
+              <label for="lines_per_chunk">每份行数阈值 <small>(--lines)</small></label>
+              <input type="number" id="lines_per_chunk" name="lines_per_chunk"
+                     min="50" max="5000" step="50" placeholder="默认 200" />
+            </div>
+            <div class="param-item">
+              <label for="max_chars">上下文最大字符数 <small>(--max-chars)</small></label>
+              <input type="number" id="max_chars" name="max_chars"
+                     min="50" max="5000" step="50" placeholder="默认 400" />
+            </div>
+            <div class="param-item">
+              <label for="task_id">任务 ID <small>(id)</small></label>
+              <input type="text" id="task_id" name="task_id"
+                     maxlength="128" placeholder="留空则自动生成 webui-{时间戳}" />
+            </div>
+          </div>
+        </div>
+
+        <div class="field">
+          <label class="checkbox-inline">
+            <input type="checkbox" id="skip_service2" name="skip_service2" />
+            <span>仅执行 Service 1（跳过 Service 2 付款信息提取）</span>
+          </label>
+        </div>
+
+        <button type="submit" id="submit-btn">开始处理</button>
+      </form>
+    </section>
+
+    <!-- 进度 -->
+    <section class="card progress-card" id="progress-card" hidden>
+      <h2>② 处理进度</h2>
+      <ol class="progress-list">
+        <li data-stage="upload">上传文件</li>
+        <li data-stage="step1">
+          <span class="stage-label">Service 1：条款分类 + 上下文</span>
+          <span class="stage-spinner" aria-hidden="true"></span>
+        </li>
+        <li data-stage="step2">
+          <span class="stage-label">Service 2：付款信息提取</span>
+          <span class="stage-spinner" aria-hidden="true"></span>
+        </li>
+      </ol>
+      <div id="status-msg" class="status-msg"></div>
+      <div id="timer-display" class="timer-display"></div>
+    </section>
+
+    <!-- 错误 -->
+    <section class="card error-card" id="error-card" hidden>
+      <h2>⚠️ 错误</h2>
+      <div id="error-body"></div>
+    </section>
+
+    <!-- Step 1 -->
+    <section class="card" id="step1-card" hidden>
+      <h2>Step 1 · Service 1 付款/质保期相关条款</h2>
+      <div class="meta" id="step1-meta"></div>
+      <div class="table-wrap">
+        <table class="data-table" id="step1-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>归类后</th>
+              <th>原始类别</th>
+              <th>条款</th>
+              <th>上下文</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <!-- 全部条款（含其他类别）展开区 -->
+      <details class="all-clauses-block" id="all-clauses-block">
+        <summary>
+          <span class="toggle-text">展开查看 Service 1 全部条款分类</span>
+          <span class="all-count" id="all-clauses-count"></span>
+        </summary>
+        <div class="all-clauses-filters" id="all-clauses-filters"></div>
+        <div class="table-wrap">
+          <table class="data-table" id="all-clauses-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>类别</th>
+                <th>置信度</th>
+                <th>条款</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
+    </section>
+
+    <!-- Step 2 -->
+    <section class="card" id="step2-card" hidden>
+      <h2>Step 2 · Service 2 付款节点提取</h2>
+      <div class="meta" id="step2-meta"></div>
+
+      <h3 class="section-title">付款条款</h3>
+      <div class="table-wrap">
+        <table class="data-table" id="payment-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>类别</th>
+              <th>阶段类型</th>
+              <th>比例</th>
+              <th>金额</th>
+              <th>条款原文</th>
+              <th>上下文</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <h3 class="section-title">质保期</h3>
+      <div class="table-wrap">
+        <table class="data-table" id="warranty-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>质保期</th>
+              <th>条款原文</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

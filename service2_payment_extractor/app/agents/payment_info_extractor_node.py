@@ -1,0 +1,1415 @@
+# app/agents/payment_info_extractor_node.py
+
+import asyncio
+from collections import Counter
+from typing import Dict, Any, Optional, List, Tuple, Set
+from loguru import logger
+from langchain_core.runnables import RunnableConfig
+import json
+import re
+from difflib import SequenceMatcher
+from app.states.states import State, Paragraph, PaymentInfo, WarrantyInfo, ThinkingInfo
+from app.utils.rag_retriever import retrieve_payment_type
+from app.utils.payment_ratio_extractor import (
+    PaymentRatioExtractor,
+    PaymentSummaryRatioExtractor,
+    get_summary_extractor,
+    get_ratio_extractor,
+)
+from app.utils.node_decorator import node_with_progress
+from app.config.graph_config import WORKFLOW_PROGRESS_RANGES
+from app.config.env_config import (
+    get_clause_filter_keywords,
+    get_dedupe_thresholds,
+    normalize_clause_class,
+    enforce_install_payment_type,
+)
+from app.utils.debug_helper import DebugHelper
+
+
+# 统一日志前缀，便于 ELK 过滤
+_NODE_TAG = "[Service2-Extractor]"
+
+
+def _calculate_similarity(text1: str, text2: str) -> float:
+    """
+    计算两个字符串的相似度，返回0-1之间的值
+    """
+    return SequenceMatcher(None, text1, text2).ratio()
+
+
+# 上下文合并阈值（H1，I9 env 化）：仅在存在前后缀/子串重叠 且 相似度足够高时才合并
+_DEDUPE_THRESHOLDS = get_dedupe_thresholds()
+_CONTEXT_MERGE_SIM_THRESHOLD = _DEDUPE_THRESHOLDS["context_similarity"]
+_CONTEXT_OVERLAP_MIN_LEN = int(_DEDUPE_THRESHOLDS["context_overlap_chars"])
+
+
+def _has_prefix_suffix_overlap(a: str, b: str, min_len: int = _CONTEXT_OVERLAP_MIN_LEN) -> bool:
+    """判断两段文本是否存在前后缀重叠（用于上下文合并的硬条件）。
+
+    若 a 的后缀与 b 的前缀、或 b 的后缀与 a 的前缀，有长度 >= min_len 的重叠，则视为可合并候选。
+    """
+    if not a or not b:
+        return False
+    upper = min(len(a), len(b))
+    if upper < min_len:
+        return False
+    # a 的后缀 == b 的前缀
+    for overlap_len in range(upper, min_len - 1, -1):
+        if a[-overlap_len:] == b[:overlap_len]:
+            return True
+    # b 的后缀 == a 的前缀
+    for overlap_len in range(upper, min_len - 1, -1):
+        if b[-overlap_len:] == a[:overlap_len]:
+            return True
+    return False
+
+
+class _DSU:
+    """简易并查集（按秩合并 + 路径压缩），用于上下文合并。"""
+
+    def __init__(self, n: int) -> None:
+        self.parent = list(range(n))
+        self.rank = [0] * n
+
+    def find(self, x: int) -> int:
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, x: int, y: int) -> bool:
+        rx, ry = self.find(x), self.find(y)
+        if rx == ry:
+            return False
+        if self.rank[rx] < self.rank[ry]:
+            rx, ry = ry, rx
+        self.parent[ry] = rx
+        if self.rank[rx] == self.rank[ry]:
+            self.rank[rx] += 1
+        return True
+
+
+def _deduplicate_and_merge_contexts(
+    clauses_with_contexts: List[Tuple[str, int]]
+) -> Tuple[List[str], List[int]]:
+    """
+    对条款上下文进行去重和合并（基于并查集，复杂度 O(n^2 * L)）。
+
+    策略：
+    1. 完全相同的上下文 → 先按文本聚合为一组；
+    2. 仅当存在前后缀/子串重叠，且 SequenceMatcher 相似度 >= 0.85 时才判为可合并（H1）；
+    3. 用并查集将可合并组合并为连通分量（H2），结果顺序稳定（按每组最小原始下标）。
+
+    Args:
+        clauses_with_contexts: [(clause_context, original_index), ...] 列表
+
+    Returns:
+        merged_contexts: 去重合并后的上下文列表（不含序号标记）
+        context_refs: 与输入等长的整数列表，每个元素是去重后上下文列表中的索引（0-based）
+    """
+    if not clauses_with_contexts:
+        return [], []
+
+    # ---- Step 1: 按文本聚合为初始组 ----
+    text_to_group: Dict[str, int] = {}
+    group_members: List[List[int]] = []  # group_id -> [original indices]
+    group_rep_text: List[str] = []        # group_id -> 代表文本（初始为该文本）
+
+    for orig_idx, (ctx, _) in enumerate(clauses_with_contexts):
+        gid = text_to_group.get(ctx)
+        if gid is None:
+            gid = len(group_members)
+            text_to_group[ctx] = gid
+            group_members.append([orig_idx])
+            group_rep_text.append(ctx)
+        else:
+            group_members[gid].append(orig_idx)
+
+    n_groups = len(group_members)
+
+    # ---- Step 2: 并查集合并重叠/高相似度组 ----
+    dsu = _DSU(n_groups)
+    for i in range(n_groups):
+        ctx_i = group_rep_text[i]
+        for j in range(i + 1, n_groups):
+            if dsu.find(i) == dsu.find(j):
+                continue
+            ctx_j = group_rep_text[j]
+            if ctx_i in ctx_j or ctx_j in ctx_i:
+                dsu.union(i, j)
+                continue
+            if not _has_prefix_suffix_overlap(ctx_i, ctx_j):
+                continue
+            if SequenceMatcher(None, ctx_i, ctx_j).ratio() >= _CONTEXT_MERGE_SIM_THRESHOLD:
+                dsu.union(i, j)
+
+    # ---- Step 3: 按根聚合，按组内最小原始下标排序输出 ----
+    root_to_gids: Dict[int, List[int]] = {}
+    for gid in range(n_groups):
+        root_to_gids.setdefault(dsu.find(gid), []).append(gid)
+
+    def _group_min_idx(gids: List[int]) -> int:
+        return min(min(group_members[g]) for g in gids)
+
+    sorted_components = sorted(root_to_gids.values(), key=_group_min_idx)
+
+    merged_contexts: List[str] = []
+    index_to_ref: List[int] = [-1] * len(clauses_with_contexts)
+
+    for ref_idx, gids in enumerate(sorted_components):
+        # 依序合并组内代表文本
+        sorted_gids = sorted(gids, key=lambda g: min(group_members[g]))
+        rep = group_rep_text[sorted_gids[0]]
+        for g in sorted_gids[1:]:
+            merged_rep = _merge_overlapping_strings(rep, group_rep_text[g])
+            if merged_rep is not None:
+                rep = merged_rep
+            # 否则跳过拼接（无重叠），保留较长的代表文本
+            elif len(group_rep_text[g]) > len(rep):
+                rep = group_rep_text[g]
+        merged_contexts.append(rep)
+        for g in sorted_gids:
+            for orig_idx in group_members[g]:
+                index_to_ref[orig_idx] = ref_idx
+
+    # 统计日志（M8：使用 Counter 代替 list.count）
+    saved = len(clauses_with_contexts) - len(merged_contexts)
+    logger.info(
+        f"{_NODE_TAG} 上下文去重合并完成：输入 {len(clauses_with_contexts)} 条 → "
+        f"去重后 {len(merged_contexts)} 条（节省 {saved} 条）"
+    )
+    ref_counter = Counter(index_to_ref)
+    for ri, mc in enumerate(merged_contexts):
+        logger.debug(f"  上下文[{ri + 1}]（被 {ref_counter[ri]} 条条款引用）: {mc[:100]}...")
+
+    return merged_contexts, index_to_ref
+
+
+def _merge_overlapping_strings(a: str, b: str) -> Optional[str]:
+    """
+    将两个可能有重叠的字符串合并为一个超集字符串。
+    策略：找到 a 的后缀和 b 的前缀的最大重叠，将 b 追加到 a 后面。
+    如果完全不重叠，返回 None（由调用方决定如何处理），避免产生语义不相关的超长拼接。
+    """
+    if not a:
+        return b
+    if not b:
+        return a
+
+    # 包含关系：较长者即是超集
+    if a in b:
+        return b
+    if b in a:
+        return a
+
+    # a 的后缀 == b 的前缀
+    for overlap_len in range(min(len(a), len(b)), 0, -1):
+        if a[-overlap_len:] == b[:overlap_len]:
+            return a + b[overlap_len:]
+
+    # b 的后缀 == a 的前缀
+    for overlap_len in range(min(len(a), len(b)), 0, -1):
+        if b[-overlap_len:] == a[:overlap_len]:
+            return b + a[overlap_len:]
+
+    # 完全不重叠：不强行拼接
+    return None
+
+
+def _remove_duplicate_payment_items(payment_items: List[Dict], similarity_threshold: Optional[float] = None) -> List[Dict]:
+    """
+    去除字符相似度大于阈值的重复支付条款，保留较长的条款
+    
+    Args:
+        payment_items: 待去重的列表
+        similarity_threshold: 相似度阈值；None 时使用 env 默认值（DEDUPE_ITEM_SIM_LOOSE）
+    
+    Returns:
+        去重后的支付条款列表
+    """
+    if not payment_items or len(payment_items) <= 1:
+        return payment_items
+
+    if similarity_threshold is None:
+        similarity_threshold = _DEDUPE_THRESHOLDS["item_similarity_loose"]
+
+    logger.info(f"开始对初步提取结果进行去重处理，原始条款数量: {len(payment_items)}，阈值: {similarity_threshold}")
+    
+    # 创建条款副本，避免修改原始数据
+    items = list(payment_items)
+    to_remove = set()
+    
+    # 两两比较条款
+    for i in range(len(items)):
+        if i in to_remove:
+            continue
+            
+        item1 = items[i]
+        text1 = item1.get('payment_clause', '').strip()
+        
+        for j in range(i + 1, len(items)):
+            if j in to_remove:
+                continue
+
+            item2 = items[j]
+
+            # 不同 clause_class 的条目不进行去重（混签展开产生的设备/安装副本需各自保留）
+            cc1 = item1.get('clause_class', [])
+            cc2 = item2.get('clause_class', [])
+            if cc1 != cc2:
+                continue
+
+            # 不同 payment_type 的条目不进行去重（同一条款拆分出的多个付款节点需各自保留）
+            pt1 = item1.get('payment_type', '')
+            pt2 = item2.get('payment_type', '')
+            if pt1 and pt2 and pt1 != pt2:
+                continue
+
+            text2 = item2.get('payment_clause', '').strip()
+            
+            # 检查包含关系
+            is_duplicate = False
+            duplicate_reason = ""
+            
+            # 0. 同 payment_type + 同 amount → 视为重复（来自不同段落的同一笔付款）
+            amt1 = str(item1.get('payment_amount', '') or '').replace('元', '').replace(',', '').strip()
+            amt2 = str(item2.get('payment_amount', '') or '').replace('元', '').replace(',', '').strip()
+            if pt1 and pt1 == pt2 and amt1 and amt2 and amt1 == amt2:
+                is_duplicate = True
+                duplicate_reason = f"同payment_type='{pt1}' + 同amount='{amt1}'"
+            
+            # 1. 检查完全包含关系
+            if not is_duplicate and text1 in text2 and len(text1) < len(text2):
+                is_duplicate = True
+                duplicate_reason = "条款1完全包含在条款2中"
+            elif not is_duplicate and text2 in text1 and len(text2) < len(text1):
+                is_duplicate = True
+                duplicate_reason = "条款2完全包含在条款1中"
+            
+            # 2. 检查相似度
+            if not is_duplicate:
+                similarity = _calculate_similarity(text1, text2)
+                if similarity >= similarity_threshold:
+                    is_duplicate = True
+                    duplicate_reason = f"字符相似度: {similarity:.2f}"
+            
+            if is_duplicate:
+                # 保留较长的条款，移除较短的
+                if len(text1) >= len(text2):
+                    to_remove.add(j)
+                    logger.info(f"发现重复条款，原因: {duplicate_reason}")
+                    logger.info(f"  保留: IDX={item1.get('sub_clause_index', '')}, 长度={len(text1)}")
+                    logger.info(f"  移除: IDX={item2.get('sub_clause_index', '')}, 长度={len(text2)}")
+                    logger.info(f"  条款1: {text1[:150]}...")
+                    logger.info(f"  条款2: {text2[:150]}...")
+                else:
+                    to_remove.add(i)
+                    logger.info(f"发现重复条款，原因: {duplicate_reason}")
+                    logger.info(f"  保留: IDX={item2.get('sub_clause_index', '')}, 长度={len(text2)}")
+                    logger.info(f"  移除: IDX={item1.get('sub_clause_index', '')}, 长度={len(text1)}")
+                    logger.info(f"  条款1: {text1[:150]}...")
+                    logger.info(f"  条款2: {text2[:150]}...")
+                    break  # 当前条款被移除，跳出内层循环
+    
+    # 移除标记的条款
+    result = [item for i, item in enumerate(items) if i not in to_remove]
+    
+    logger.success(f"初步提取结果去重完成，移除 {len(to_remove)} 个重复条款，剩余 {len(result)} 个条款")
+    return result
+
+
+def _enforce_unique_payment_type(items: List[Any]) -> List[Any]:
+    """
+    代码级强制去重：确保同一 clause_category 下每个 payment_type 只保留一个条款。
+    当存在重复时，按以下优先级选择最优条款：
+    1. 条款文本包含具体支付动作（支付/付款）且包含金额/比例
+    2. 条款文本更长（信息更完整）
+    """
+    # 按 (clause_category, payment_type) 分组
+    groups: Dict[tuple, List[Any]] = {}
+    non_grouped = []  # 没有 clause_category 或 payment_type 的条款直接保留
+
+    for item in items:
+        category = getattr(item, 'clause_category', None)
+        ptype = getattr(item, 'payment_type', None)
+        if category and ptype:
+            key = (category, ptype)
+            groups.setdefault(key, []).append(item)
+        else:
+            # 缺字段的条款记录日志后仍保留，交由下游发现问题（H4 完整修复在中长期重构中）
+            logger.warning(
+                f"{_NODE_TAG} 代码级去重跳过条款：缺少 clause_category 或 payment_type，"
+                f"id={getattr(item, 'id', '?')}, category={category}, payment_type={ptype}"
+            )
+            non_grouped.append(item)
+
+    result = list(non_grouped)
+    for key, group in groups.items():
+        if len(group) == 1:
+            result.append(group[0])
+        else:
+            # 需要去重：按规则打分选最优
+            best = _pick_best_clause(group)
+            removed_ids = [getattr(it, 'id', '?') for it in group if it is not best]
+            logger.warning(
+                f"代码级强制去重: {key[0]}+{key[1]} 有 {len(group)} 个条款，"
+                f"保留 {getattr(best, 'id', '?')}，移除 {removed_ids}"
+            )
+            result.append(best)
+    
+    return result
+
+
+def _pick_best_clause(candidates: List[Any]) -> Any:
+    """从多个同 payment_type 的条款中选出最优的一个。"""
+
+    def _score(item) -> tuple:
+        clause = str(getattr(item, 'payment_clause', '') or '')
+        # 维度1: 是否包含支付动作 + 金额/比例
+        has_action = bool(re.search(r'支付|付款|汇入|付清', clause))
+        has_amount = bool(re.search(r'\d+(\.\d+)?%|百分之|万元|元整|\d+元', clause))
+        score_action = 2 if (has_action and has_amount) else (1 if has_action else 0)
+        # 维度2: 条款文本长度（信息丰富度）
+        score_len = len(clause)
+        return (score_action, score_len)
+
+    return max(candidates, key=_score)
+
+
+async def _validate_extraction_results(
+    summary_result: List[Any],
+    thinking_info: Optional[Any],
+    llm_config: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Any], Optional[Any], set]:
+    """
+    对提取结果进行校验的辅助函数。
+    使用与extract_summary相同的LLM实现进行二次校验。
+    返回: (校验后结果, 思考信息, 被去重移除的ID集合)
+    """
+    try:
+        logger.info("开始执行结果校验...")
+        
+        # 如果原始结果为空，直接返回
+        if not summary_result:
+            logger.warning("原始提取结果为空，跳过校验")
+            return summary_result, thinking_info, set()
+        
+        # 1. 先通过硬编码比较找出重复节点
+        logger.info("开始硬编码比较，识别重复节点...")
+        
+        # 按clause_category分组
+        equipment_items = []
+        installation_items = []
+        
+        for item in summary_result:
+            if hasattr(item, 'clause_category'):
+                if item.clause_category == 'equipment_payment':
+                    equipment_items.append(item)
+                elif item.clause_category == 'installation_payment':
+                    installation_items.append(item)
+        
+        # 识别设备付款条款中的重复节点
+        equipment_duplicates = []
+        equipment_payment_types = {}
+        for item in equipment_items:
+            payment_type = getattr(item, 'payment_type', '')
+            if payment_type in equipment_payment_types:
+                # 发现重复，将两个都加入重复列表
+                if equipment_payment_types[payment_type] not in equipment_duplicates:
+                    equipment_duplicates.append(equipment_payment_types[payment_type])
+                equipment_duplicates.append(item)
+            else:
+                equipment_payment_types[payment_type] = item
+        
+        # 识别安装付款条款中的重复节点
+        installation_duplicates = []
+        installation_payment_types = {}
+        for item in installation_items:
+            payment_type = getattr(item, 'payment_type', '')
+            if payment_type in installation_payment_types:
+                # 发现重复，将两个都加入重复列表
+                if installation_payment_types[payment_type] not in installation_duplicates:
+                    installation_duplicates.append(installation_payment_types[payment_type])
+                installation_duplicates.append(item)
+            else:
+                installation_payment_types[payment_type] = item
+        
+        # 记录重复节点信息
+        if equipment_duplicates:
+            logger.warning(f"设备付款条款中发现 {len(equipment_duplicates)} 个重复节点")
+            for item in equipment_duplicates:
+                logger.info(f"  - 重复节点: {getattr(item, 'payment_type', '')} (ID: {getattr(item, 'id', '')})")
+        
+        if installation_duplicates:
+            logger.warning(f"安装付款条款中发现 {len(installation_duplicates)} 个重复节点")
+            for item in installation_duplicates:
+                logger.info(f"  - 重复节点: {getattr(item, 'payment_type', '')} (ID: {getattr(item, 'id', '')})")
+        
+        # 如果没有重复节点，直接返回原始结果
+        if not equipment_duplicates and not installation_duplicates:
+            logger.success("未发现重复节点，校验通过")
+            return summary_result, thinking_info, set()
+
+        summary_extractor = await get_summary_extractor(llm_config)
+        all_duplicates = equipment_duplicates + installation_duplicates
+
+        # 3. 按 (clause_category, payment_type) 分组重复节点
+        dup_groups: Dict[tuple, List[Any]] = {}
+        for item in all_duplicates:
+            group_key = (getattr(item, 'clause_category', ''), getattr(item, 'payment_type', ''))
+            dup_groups.setdefault(group_key, []).append(item)
+
+        logger.info(f"准备按组校验：共 {len(dup_groups)} 个重复组（设备重复 {len(equipment_duplicates)} 条 + 安装重复 {len(installation_duplicates)} 条）")
+
+        # 4. 每组独立并发调用 LLM（Qwen2.5-9B 友好：单任务单输出，候选仅 2-3 条，避免跨组漏选/幻觉）
+        group_keys_ordered = list(dup_groups.keys())
+        group_tasks = []
+        for gk in group_keys_ordered:
+            group_items = dup_groups[gk]
+            payload = [
+                {
+                    "id": getattr(it, 'id', ''),
+                    "payment_clause": getattr(it, 'payment_clause', ''),
+                    "payment_type": getattr(it, 'payment_type', ''),
+                    "final_ratio": getattr(it, 'final_ratio', ''),
+                    "final_amount": getattr(it, 'final_amount', ''),
+                    "clause_category": getattr(it, 'clause_category', ''),
+                }
+                for it in group_items
+            ]
+            group_tasks.append(summary_extractor.verify_single_group_single(payload))
+
+        group_results = await asyncio.gather(*group_tasks, return_exceptions=True)
+
+        # 5. 汇总每组的 selected_id，并累计 reason 作为 thinking
+        final_result = list(summary_result)
+        dedup_removed_ids: set = set()
+        thinking_lines: List[str] = []
+
+        for gk, gr in zip(group_keys_ordered, group_results):
+            group_items = dup_groups[gk]
+            group_ids = {getattr(it, 'id', '') for it in group_items}
+
+            if isinstance(gr, Exception):
+                logger.warning(f"去重组 {gk} LLM 调用异常: {gr}，交给代码级兜底")
+                continue
+
+            selected_id = (gr or {}).get("select_clause_id", "")
+            reason = (gr or {}).get("reason", "")
+            if selected_id not in group_ids:
+                # verify_single_group_single 内部已做兜底，这里一般不会进入；保险再兜一次
+                logger.warning(f"去重组 {gk} 选出 ID={selected_id} 不在组内 {group_ids}，交给代码级兜底")
+                continue
+
+            thinking_lines.append(f"[{gk[0]}|{gk[1]}] 保留 {selected_id}：{reason}")
+            for item in group_items:
+                item_id = getattr(item, 'id', '')
+                if item_id != selected_id and item in final_result:
+                    final_result.remove(item)
+                    dedup_removed_ids.add(item_id)
+                    logger.info(f"去重移除条款 ID={item_id}（组={gk}，保留 {selected_id}）")
+
+        # 6. 组装 thinking_info（兼容原返回结构）
+        validated_thinking_info = thinking_info
+        if thinking_lines:
+            try:
+                validated_thinking_info = ThinkingInfo.model_validate({"thinking_output": "\n".join(thinking_lines)})
+            except Exception as e:
+                logger.warning(f"按组去重的 thinking_info 组装失败: {e}")
+
+        # 7. 代码级强制去重兜底：确保同一 clause_category 下每个 payment_type 只保留一个
+        before_enforce = set(getattr(it, 'id', '') for it in final_result)
+        final_result = _enforce_unique_payment_type(final_result)
+        after_enforce = set(getattr(it, 'id', '') for it in final_result)
+        dedup_removed_ids |= (before_enforce - after_enforce)
+
+        logger.success(f"校验完成，最终保留 {len(final_result)} 个条款，去重移除ID: {dedup_removed_ids or '无'}")
+        return final_result, validated_thinking_info, dedup_removed_ids
+        
+    except Exception as e:
+        logger.error(f"结果校验过程中发生错误: {e}", exc_info=True)
+        logger.warning("校验失败，对原始结果执行代码级强制去重后返回")
+        return _enforce_unique_payment_type(summary_result), thinking_info, set()
+
+
+
+async def _process_single_payment_paragraph(
+    para: Paragraph,
+    state: State,
+    current_clauses_chunk: str,
+    para_global_idx: int = 0,
+) -> Tuple[List[dict], List[dict], List[dict]]:
+    """
+    对单个段落（= 一个原子子条款）进行 RAG+LLM 处理。
+    支持从单个条款中提取多个付款节点（如分期付款条款包含多个独立付款动作）。
+    返回: (初步提取信息字典列表, 设备RAG示例列表, 安装RAG示例列表)
+    """
+    node_name = "payment_info_extractor"
+    results = []
+    equipment_rag_examples = []
+    installation_rag_examples = []
+
+    clause_text = (para.clause or "").strip()
+    if not clause_text:
+        logger.warning(f"[{node_name}] 段落(global_idx:{para_global_idx}) 无有效条款文本，跳过。")
+        return results, equipment_rag_examples, installation_rag_examples
+
+    # 从 clause_class 推导英文类型（M7：使用集中化的 normalize_clause_class）
+    type_list: List[str] = []
+    for cc in para.clause_class:
+        canonical = normalize_clause_class(cc)
+        if canonical == "installation_payment":
+            type_list = ["installation_payment"]
+            break
+        if canonical == "equipment_payment":
+            type_list = ["equipment_payment"]
+            break
+    if not type_list:
+        type_list = ["equipment_payment"]
+
+    logger.debug(f"[{node_name}] 开始处理条款 (global_idx:{para_global_idx})...")
+
+    # M4：错误分层，便于定位哪一步失败
+    # --- RAG 阶段 ---
+    try:
+        rag_result = await retrieve_payment_type(clause_text, type_list)
+    except Exception as e:
+        logger.error(
+            f"[{node_name}][RAG失败] 条款(global_idx:{para_global_idx}) RAG 检索异常: {e}",
+            exc_info=True,
+        )
+        return results, equipment_rag_examples, installation_rag_examples
+
+    final_rag_results = rag_result.get("final_results", [])
+    if not final_rag_results:
+        logger.warning(f"[{node_name}] 条款(global_idx:{para_global_idx}) RAG未召回，跳过。")
+        return results, equipment_rag_examples, installation_rag_examples
+
+    # RAG投票获取参考类型（仅作为LLM输入的参考，不再作为最终类型）
+    label_counts: Dict[str, int] = {}
+    for r in final_rag_results:
+        label = r.get("label") or r.get("payment_type", "未知类型")
+        if label and label != "未知类型":
+            label_counts[label] = label_counts.get(label, 0) + 1
+
+    if label_counts:
+        rag_payment_type = max(label_counts.items(), key=lambda x: x[1])[0]
+        logger.debug(f"[{node_name}] RAG类别统计: {label_counts}, 参考类型: {rag_payment_type}")
+    else:
+        rag_payment_type = "未知类型"
+        logger.warning(f"[{node_name}] RAG 结果无有效类别标签，使用默认值")
+
+    # --- LLM 提取阶段 ---
+    try:
+        # 进程级单例：避免每条段落重新构造 ChatOpenAI + chain；
+        # llm_config 由 state 注入，单例内部按需重新初始化（首次或配置变化时）。
+        extractor = await get_ratio_extractor(state.get("payment_ratio_llm_config") or state.get("llm_config"))
+        clause_class_str = type_list[0] if type_list else "equipment_payment"
+        payment_nodes = await extractor.extract_payment_info(
+            payment_clause=clause_text,
+            payment_type=rag_payment_type,
+            rag_results=final_rag_results,
+            current_clauses_chunk=current_clauses_chunk,
+            state=state,
+            clause_class=clause_class_str,
+        )
+    except Exception as e:
+        logger.error(
+            f"[{node_name}][LLM失败] 条款(global_idx:{para_global_idx}) 付款信息提取异常: {e}",
+            exc_info=True,
+        )
+        return results, equipment_rag_examples, installation_rag_examples
+
+    if not payment_nodes:
+        logger.warning(f"[{node_name}] 条款(global_idx:{para_global_idx}) LLM未提取到有效付款节点。")
+        return results, equipment_rag_examples, installation_rag_examples
+
+    logger.info(
+        f"[{node_name}] 条款(global_idx:{para_global_idx}) 识别到 {len(payment_nodes)} 个付款节点"
+    )
+
+    # --- 解析/构造阶段（M2：sub_clause_index 统一为 "i.s" 字符串） ---
+    for sub_idx, node in enumerate(payment_nodes):
+        try:
+            compound_index = f"{para_global_idx}.{sub_idx}"
+            node_payment_type = node.get("payment_type") or rag_payment_type
+            result = {
+                "sub_clause_index": compound_index,
+                "payment_clause": clause_text,
+                "clause_context": current_clauses_chunk,
+                "payment_type": node_payment_type,
+                "payment_amount": node.get("amount"),
+                "payment_ratio": node.get("ratio"),
+                "clause_class": type_list,
+                "metadata": {"source": "rag", "created_at": state.get("created_at")},
+            }
+            logger.success(
+                f"[{node_name}] 条款(global_idx:{para_global_idx}, sub:{sub_idx}) 初步提取完成，"
+                f"类型: {node_payment_type}, 比例: {node.get('ratio')}, 金额: {node.get('amount')}"
+            )
+            results.append(result)
+        except Exception as e:
+            logger.error(
+                f"[{node_name}][解析失败] 条款(global_idx:{para_global_idx}, sub:{sub_idx}) 构造结果异常: {e}",
+                exc_info=True,
+            )
+            continue
+
+    rag_example = final_rag_results[0] if final_rag_results else None
+    if rag_example:
+        if "equipment_payment" in type_list:
+            equipment_rag_examples.append(rag_example)
+        elif "installation_payment" in type_list:
+            installation_rag_examples.append(rag_example)
+
+    return results, equipment_rag_examples, installation_rag_examples
+
+@node_with_progress(node_name="payment_info_extractor", display_name="支付信息深度提取", track_state_keys=["paragraphs"], progress_range=WORKFLOW_PROGRESS_RANGES.get("payment_info_extractor"))
+async def payment_info_extractor_node(state: State, config: Optional[RunnableConfig] = None) -> Dict[str, Any]:
+    logger.info("=" * 50)
+    logger.info("PAYMENT_INFO_EXTRACTOR_NODE 开始执行...")
+    logger.info("=" * 50)
+
+    configurable_config = config.get("configurable", {}) if config else {}
+    is_debug_mode = configurable_config.get("debug_mode", False)
+
+    original_paragraphs = state.get("paragraphs", [])
+    if not original_paragraphs:
+        logger.warning(f"{_NODE_TAG} 没有找到段落，跳过支付信息提取")
+        return {"current_step": "payment_extract_skipped"}
+
+    # L4：使用 Pydantic 的 model_copy(deep=True) 替代通用 deepcopy
+    all_paragraphs = [p.model_copy(deep=True) for p in original_paragraphs]
+
+    # 混签付款条款：延迟到步骤1（有效性验证）之后再展开/归属判定，
+    # 由 LLM 同步返回 category 决定路由，避免对设备小节条款走安装流水线产生幻觉。
+    mixed_count = sum(1 for p in all_paragraphs if "混签付款条款" in p.clause_class)
+    if mixed_count:
+        logger.info(f"{_NODE_TAG} 发现 {mixed_count} 个混签付款条款，将在有效性验证阶段同步执行归属判定")
+
+    #######存储stage0的paragraphs
+    await DebugHelper.save_snapshot(
+        doc_id=state['document_id'], step_name="stage0",
+        content={"payment_paragraphs": all_paragraphs},
+        is_debug_enabled = is_debug_mode
+    )
+    
+    payment_paragraphs = [
+        p for p in all_paragraphs
+        if "设备付款条款" in p.clause_class
+           or "安装付款条款" in p.clause_class
+           or "混签付款条款" in p.clause_class
+    ]
+    warranty_paragraphs = [
+        p for p in all_paragraphs
+        if "质保期条款" in p.clause_class
+    ]
+    logger.info(
+        f"{_NODE_TAG} 接收到 {len(all_paragraphs)} 个段落，"
+        f"其中 payment={len(payment_paragraphs)}, warranty={len(warranty_paragraphs)}"
+    )
+
+    # ---- 关键词预过滤（直接过滤 payment_paragraphs，不可被后续异常绕过） ----
+    _INVALID_KEYWORDS = get_clause_filter_keywords()
+    _pre_filtered_paras = []
+    _pre_invalid_count = 0
+    for para in payment_paragraphs:
+        clause_text = (para.clause or "").strip()
+        matched_kw = next((kw for kw in _INVALID_KEYWORDS if kw in clause_text), None)
+        if matched_kw:
+            _pre_invalid_count += 1
+            logger.info(f"硬编码预过滤: 命中关键词=\"{matched_kw}\", 条款={clause_text[:80]}...")
+        else:
+            _pre_filtered_paras.append(para)
+    if _pre_invalid_count:
+        logger.success(f"硬编码预过滤完成：过滤 {_pre_invalid_count} 条，剩余 {len(_pre_filtered_paras)} 条")
+    payment_paragraphs = _pre_filtered_paras
+
+    logger.info(
+        f"{_NODE_TAG} 预过滤后分类统计："
+        f"设备={len([p for p in payment_paragraphs if '设备付款条款' in p.clause_class])}, "
+        f"安装={len([p for p in payment_paragraphs if '安装付款条款' in p.clause_class])}, "
+        f"质保={len(warranty_paragraphs)}（含混签展开）"
+    )
+
+    payment_info_extractor_node.emit_running(
+        f"正在进行付款条款有效性验证（过滤非付款条款）...",
+        config,
+        progress=5
+    )
+
+    # ========== 步骤1: 条款有效性验证（LLM校验，过滤非付款条款） ==========
+
+    def _is_table_or_non_clause(text: str) -> bool:
+        """代码预过滤：识别表格行、分隔线、备注说明等非自然语言条款，无需送入LLM。"""
+        stripped = text.strip()
+        # 表格分隔线：| --- | --- | 或 |---|---|
+        if re.match(r'^\|[\s\-|]+\|$', stripped):
+            return True
+        # 表格数据行：以 | 开头并以 | 结尾，中间有多个 | 分隔
+        if stripped.startswith('|') and stripped.endswith('|') and stripped.count('|') >= 3:
+            return True
+        # 备注/说明行——但如果包含付款关键词（付款/支付/比例/%/请款），保留送入LLM
+        if re.match(r'^备注\d*[：:]', stripped):
+            if not re.search(r'付款|支付|请款|比例|%|％|全额', stripped):
+                return True
+        return False
+
+    # 构造待验证的条款列表
+    clauses_to_validate = []
+    prefilter_count = 0
+    for i, para in enumerate(payment_paragraphs):
+        sc_text = (para.clause or "").strip()
+        if not sc_text:
+            continue
+        # 代码预过滤：表格行、分隔线、备注等直接跳过
+        if _is_table_or_non_clause(sc_text):
+            prefilter_count += 1
+            logger.info(f"预过滤跳过非自然语言条款 ID={i}: {sc_text[:80]}...")
+            continue
+        clauses_to_validate.append({
+            "id": str(i),                       # 使用全局索引作为唯一 ID
+            "clause": sc_text,
+            "clause_class": para.clause_class,
+            "clause_context": para.clause_context,
+        })
+    if prefilter_count > 0:
+        logger.info(f"代码预过滤：跳过 {prefilter_count} 条非自然语言条款（表格行/分隔线/备注等）")
+
+    validated_paragraphs = []  # 验证通过的有效条款（此时混签条款仍保留原 clause_class，待步骤1.5路由）
+    invalid_count = 0
+
+    def _expand_mixed_dual(para):
+        """混签兜底：展开为设备+安装两条副本。"""
+        eq = para.model_copy(deep=True)
+        inst = para.model_copy(deep=True)
+        eq.clause_class = ["设备付款条款"]
+        inst.clause_class = ["安装付款条款"]
+        return [eq, inst]
+
+    if clauses_to_validate:
+        try:
+            summary_extractor = await get_summary_extractor(state.get("llm_config"))
+
+            # 并发调用，每条条款独立验证
+            logger.info(f"条款有效性验证：共 {len(clauses_to_validate)} 条，并发逐条验证")
+            tasks = [
+                summary_extractor.validate_payment_clause_single(clause)
+                for clause in clauses_to_validate
+            ]
+            validated_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # 根据验证结果过滤条款
+            for clause_input, result in zip(clauses_to_validate, validated_results):
+                clause_id = clause_input["id"]
+
+                # 如果并发任务抛出异常，默认保留该条款
+                if isinstance(result, Exception):
+                    logger.warning(f"条款 ID={clause_id} 验证异常: {result}，默认保留")
+                    try:
+                        validated_paragraphs.append(payment_paragraphs[int(clause_id)])
+                    except (ValueError, IndexError):
+                        pass
+                    continue
+
+                # I3: fail-closed —— 仅当 LLM 显式返回 True 才视为有效
+                is_valid = result.get("is_valid") is True
+
+                # 找到对应的原始 paragraph
+                try:
+                    idx = int(clause_id)
+                    original_para = payment_paragraphs[idx]
+                except (ValueError, IndexError):
+                    logger.warning(f"无法找到ID为 {clause_id} 的原始条款，跳过")
+                    continue
+
+                if is_valid:
+                    validated_paragraphs.append(original_para)
+                else:
+                    invalid_count += 1
+                    reason = result.get("reason", "未知原因")
+                    logger.info(f"条款验证不通过，已过滤: ID={clause_id}, 原因={reason}")
+                    logger.debug(f"  过滤条款原文: {original_para.clause[:100]}...")
+
+            logger.success(f"条款有效性验证完成：共 {len(clauses_to_validate)} 条，验证通过 {len(validated_paragraphs)} 条，过滤 {invalid_count} 条")
+
+            # 使用验证后的条款列表进行后续处理
+            payment_paragraphs = validated_paragraphs
+
+        except Exception as e:
+            logger.opt(exception=True).error("条款有效性验证阶段发生错误: {err}", err=str(e))
+            logger.warning("验证失败，不进行过滤，继续使用原始条款列表")
+    else:
+        logger.info("没有需要验证的支付条款")
+
+    # ========== 步骤 1.5: 混签付款条款归属判定（独立 LLM 调用） ==========
+    # 仅对 is_valid 通过且原 clause_class 含"混签付款条款"的条款触发；
+    # 设计动机：对基模 Qwen2.5-9B 这类 9B 量级模型，将分类任务与有效性任务解耦，
+    # 每个子 prompt 单任务单输出，显著提升 JSON 遵循率与枚举稳定性。
+    mixed_paragraphs_to_classify = [p for p in payment_paragraphs if "混签付款条款" in p.clause_class]
+
+    if mixed_paragraphs_to_classify:
+        payment_info_extractor_node.emit_running(
+            f"正在对 {len(mixed_paragraphs_to_classify)} 条混签付款条款执行归属判定...",
+            config,
+            progress=8,
+        )
+        mixed_route_stats = {"equipment_payment": 0, "installation_payment": 0, "both": 0}
+        logger.info(f"{_NODE_TAG} 步骤1.5: 混签归属判定，共 {len(mixed_paragraphs_to_classify)} 条")
+
+        try:
+            _category_extractor = await get_summary_extractor(state.get("llm_config"))
+            _cat_inputs = [
+                {
+                    "id": str(i),
+                    "clause": (p.clause or "").strip(),
+                    "clause_context": (p.clause_context or "") or "",
+                }
+                for i, p in enumerate(mixed_paragraphs_to_classify)
+            ]
+            _cat_tasks = [
+                _category_extractor.classify_mixed_category_single(c) for c in _cat_inputs
+            ]
+            _cat_results = await asyncio.gather(*_cat_tasks, return_exceptions=True)
+        except Exception as e:
+            logger.error(f"{_NODE_TAG} 混签归属判定批次异常: {e}，全部兜底为设备", exc_info=True)
+            _cat_results = [Exception("batch_failed")] * len(mixed_paragraphs_to_classify)
+
+        routed: List = []
+        for para, res in zip(mixed_paragraphs_to_classify, _cat_results):
+            if isinstance(res, Exception):
+                logger.warning(f"{_NODE_TAG} 混签归属判定失败，兜底→equipment：{res}")
+                cat = "equipment_payment"
+                reason = "classifier_exception"
+            else:
+                cat = res.get("category") or "equipment_payment"
+                if cat not in ("equipment_payment", "installation_payment", "both"):
+                    cat = "equipment_payment"
+                reason = res.get("reason", "")
+
+            mixed_route_stats[cat] = mixed_route_stats.get(cat, 0) + 1
+            if cat == "both":
+                routed.extend(_expand_mixed_dual(para))
+                logger.info(f"{_NODE_TAG} 混签归属=both 展开为双轨。reason={reason}")
+            elif cat == "installation_payment":
+                inst = para.model_copy(deep=True)
+                inst.clause_class = ["安装付款条款"]
+                routed.append(inst)
+                logger.info(f"{_NODE_TAG} 混签归属=installation。reason={reason}")
+            else:  # equipment_payment
+                eq = para.model_copy(deep=True)
+                eq.clause_class = ["设备付款条款"]
+                routed.append(eq)
+                logger.info(f"{_NODE_TAG} 混签归属=equipment。reason={reason}")
+
+        _non_mixed = [p for p in payment_paragraphs if "混签付款条款" not in p.clause_class]
+        payment_paragraphs = _non_mixed + routed
+        logger.success(
+            f"{_NODE_TAG} 混签归属判定完成: {mixed_route_stats}；"
+            f"混签路由后总条款数 {len(payment_paragraphs)}"
+        )
+
+    # 安全兜底：任何原因残留的混签条款统一双轨展开，保证下游不见混签
+    _remaining_mixed = [p for p in payment_paragraphs if "混签付款条款" in p.clause_class]
+    if _remaining_mixed:
+        logger.warning(f"{_NODE_TAG} 仍残留 {len(_remaining_mixed)} 个混签条款，兜底展开为双轨")
+        _non_mixed = [p for p in payment_paragraphs if "混签付款条款" not in p.clause_class]
+        _expanded = []
+        for p in _remaining_mixed:
+            _expanded.extend(_expand_mixed_dual(p))
+        payment_paragraphs = _non_mixed + _expanded
+
+    # 取出所有质保期相关条款 —— 每个 para 就是一个条款，直接使用 clause 字段
+    warranty_text_items = [
+        para.clause.strip()
+        for para in warranty_paragraphs
+        if para.clause.strip()
+    ]
+
+    # 无论是否存在支付段落，都先单独调用质保抽取（使用专门接口）
+    # H8：质保结果只通过返回值上报，不再直接 mutate state
+    final_warranty_info: Optional[WarrantyInfo] = None
+    warranty_thinking: Optional[ThinkingInfo] = None
+    if warranty_text_items:
+        try:
+            summary_extractor = await get_summary_extractor(state.get("llm_config"))
+            _, warranty_only_result, warranty_thinking = await summary_extractor.extract_summary_warranty(warranty_text_items)
+            if warranty_only_result:
+                await DebugHelper.save_snapshot(
+                    doc_id=state['document_id'], step_name="warranty_info",
+                    content={
+                        "warranty": warranty_only_result.warranty,
+                        "warranty_clause": warranty_text_items,
+                        "effective_conditions": warranty_only_result.effective_conditions,
+                        "closed_end_conditions": warranty_only_result.closed_end_conditions,
+                        "warranty_thinking": warranty_thinking.thinking_output if warranty_thinking else None},
+                    is_debug_enabled=is_debug_mode
+                )
+                final_warranty_info = warranty_only_result
+                logger.success(
+                    f"{_NODE_TAG} 质保期提取成功：warranty={warranty_only_result.warranty}, "
+                    f"effective_conditions={warranty_only_result.effective_conditions}, "
+                    f"closed_end_conditions={warranty_only_result.closed_end_conditions}"
+                )
+                for para in all_paragraphs:
+                    if "质保期条款" in para.clause_class:
+                        if "warranty_details" not in para.metadata:
+                            para.metadata["warranty_details"] = []
+                        para.metadata["warranty_details"].append({
+                            "warranty_period": warranty_only_result.warranty,
+                            "warranty_clause": warranty_only_result.warranty_clause,
+                            "source": "llm_warranty_only"
+                        })
+            else:
+                logger.warning(f"{_NODE_TAG} 未能单独提取到质保期信息")
+        except Exception as inner_e:
+            logger.error(f"{_NODE_TAG} 调用 extract_summary_warranty 时发生错误: {inner_e}", exc_info=True)
+
+    # 如果没有支付段落，直接返回（保留原始返回格式）
+    if not payment_paragraphs:
+        logger.info(f"{_NODE_TAG} 未找到支付相关段落，已单独提取质保期信息，跳过支付信息提取。")
+        return {
+            "payment_infos": [],
+            "warranty_info": final_warranty_info or state.get("warranty_info"),
+            "thinking_info": warranty_thinking or state.get("thinking_info"),
+            "current_step": "payment_extract_skipped",
+            "paragraphs": all_paragraphs
+        }
+    logger.info(f"{_NODE_TAG} 找到 {len(payment_paragraphs)} 个支付段落，准备并发提取信息...")
+    payment_info_extractor_node.emit_running(
+        f"正在对 {len(payment_paragraphs)} 个支付条款进行RAG+LLM分析...",
+        config,
+        progress=20
+    )
+
+    # 每个 para 是一个原子子条款，用全局枚举 index 作为唯一标识
+    tasks = []
+    for i, para in enumerate(payment_paragraphs):
+        tasks.append(asyncio.create_task(
+            _process_single_payment_paragraph(para, state, para.clause_context, para_global_idx=i)
+        ))
+
+    task_results = await asyncio.gather(*tasks)
+
+    # 解包每个任务的结果
+    processed_results = []
+    all_equipment_rag_examples = []
+    all_installation_rag_examples = []
+    for results, equipment_rag_examples, installation_rag_examples in task_results:
+        processed_results.append(results)
+        all_equipment_rag_examples.extend(equipment_rag_examples)
+        all_installation_rag_examples.extend(installation_rag_examples)
+
+    initial_payment_items = [item for para_result in processed_results for item in para_result]
+
+    logger.info(f"[去重前] initial_payment_items 共 {len(initial_payment_items)} 个")
+    for _i, item in enumerate(initial_payment_items):
+        logger.info(f"  去重前[{_i}]: sub_clause_index={item.get('sub_clause_index')}, clause_class={item.get('clause_class')}, payment_type={item.get('payment_type')}, amount={item.get('payment_amount')}")
+
+    # 对初步提取结果进行字符相似度去重
+    logger.info("开始对初步提取结果进行字符相似度去重...")
+    initial_payment_items = _remove_duplicate_payment_items(
+        initial_payment_items,
+        similarity_threshold=_DEDUPE_THRESHOLDS["item_similarity_strict"],
+    )
+
+    logger.info(f"[去重后] initial_payment_items 共 {len(initial_payment_items)} 个")
+    for _i, item in enumerate(initial_payment_items):
+        logger.info(f"  去重后[{_i}]: sub_clause_index={item.get('sub_clause_index')}, clause_class={item.get('clause_class')}, payment_type={item.get('payment_type')}, amount={item.get('payment_amount')}")
+
+    # ---- 上下文去重合并：按 clause_class 分组后统一处理 ----
+    equipment_items_for_context = []   # [(clause_context, sub_clause_index), ...]
+    install_items_for_context = []
+    for item in initial_payment_items:
+        ctx = item.get("clause_context", "")
+        sci = item["sub_clause_index"]
+        if 'equipment_payment' in item.get('clause_class', []):
+            equipment_items_for_context.append((ctx, sci))
+        elif 'installation_payment' in item.get('clause_class', []):
+            install_items_for_context.append((ctx, sci))
+
+    # 设备组去重合并
+    equip_merged_contexts, equip_context_refs = _deduplicate_and_merge_contexts(equipment_items_for_context)
+    # 安装组去重合并
+    install_merged_contexts, install_context_refs = _deduplicate_and_merge_contexts(install_items_for_context)
+
+    # 构建去重后的 chunk_text_map（每条上下文带序号）
+    equip_chunks_text = ""
+    for idx, ctx in enumerate(equip_merged_contexts, 1):
+        equip_chunks_text += f"{idx}. {ctx}\n\n"
+
+    install_chunks_text = ""
+    for idx, ctx in enumerate(install_merged_contexts, 1):
+        install_chunks_text += f"{idx}. {ctx}\n\n"
+
+    chunk_text_map = {
+        "equipment_chunks": equip_chunks_text,
+        "installation_chunks": install_chunks_text
+    }
+
+    # 构建 sub_clause_index -> 去重后上下文引用 的映射（直接 zip，一次遍历）
+    equip_sci_to_ref = {
+        sci: ref
+        for (_, sci), ref in zip(equipment_items_for_context, equip_context_refs)
+    }
+    install_sci_to_ref = {
+        sci: ref
+        for (_, sci), ref in zip(install_items_for_context, install_context_refs)
+    }
+
+    logger.info(f"上下文去重合并统计:")
+    logger.info(f"  设备组：{len(equipment_items_for_context)} 条上下文 → {len(equip_merged_contexts)} 条唯一上下文（节省 {len(equipment_items_for_context) - len(equip_merged_contexts)} 条重复）")
+    logger.info(f"  安装组：{len(install_items_for_context)} 条上下文 → {len(install_merged_contexts)} 条唯一上下文（节省 {len(install_items_for_context) - len(install_merged_contexts)} 条重复）")
+    # M8：使用 Counter 替换 list.count，避免循环内 O(n) 调用
+    equip_ref_counter = Counter(equip_context_refs)
+    install_ref_counter = Counter(install_context_refs)
+    for ref_idx, mc in enumerate(equip_merged_contexts, 1):
+        logger.debug(f"    设备上下文[{ref_idx}]（被 {equip_ref_counter[ref_idx - 1]} 条条款引用）: {mc[:100]}...")
+    for ref_idx, mc in enumerate(install_merged_contexts, 1):
+        logger.debug(f"    安装上下文[{ref_idx}]（被 {install_ref_counter[ref_idx - 1]} 条条款引用）: {mc[:100]}...")
+
+    items_for_summary = []
+    install_items_for_summary = []
+    summary_key_to_initial_item: Dict[str, Dict] = {}
+    eq_seq = 0   # 设备类别内连续编号
+    in_seq = 0   # 安装类别内连续编号
+    for item in initial_payment_items:
+        if 'equipment_payment' in item.get('clause_class', []):
+            prefixed_key = f"eq_{eq_seq}"   # 分类内连续编号，避免9B模型重编号
+            eq_seq += 1
+            summary_key_to_initial_item[prefixed_key] = item
+            logger.info(f"  路由[sub_clause_index={item['sub_clause_index']}] → equipment, prefixed_key={prefixed_key}, payment_type={item.get('payment_type')}, clause_class={item.get('clause_class')}")
+            sci = item["sub_clause_index"]
+            context_ref = equip_sci_to_ref.get(sci, 0) + 1  # 转为1-based，与chunk_text_map中的编号对齐
+            items_for_summary.append({
+                "id": prefixed_key,
+                "payment_clause": item["payment_clause"],
+                "context_ref": context_ref,  # 1-based，指向 chunk_text_map 中的上下文编号
+                "payment_type": item["payment_type"],
+                'init_amount': item['payment_amount'],
+                "init_ratio": f"{round(item['payment_ratio']*100, 2)}%" if item["payment_ratio"] is not None else None
+            })
+        elif 'installation_payment' in item.get('clause_class', []):
+            prefixed_key = f"in_{in_seq}"   # 分类内连续编号，避免9B模型重编号
+            in_seq += 1
+            summary_key_to_initial_item[prefixed_key] = item
+            logger.info(f"  路由[sub_clause_index={item['sub_clause_index']}] → installation, prefixed_key={prefixed_key}, payment_type={item.get('payment_type')}, clause_class={item.get('clause_class')}")
+            sci = item["sub_clause_index"]
+            context_ref = install_sci_to_ref.get(sci, 0) + 1  # 转为1-based，与chunk_text_map中的编号对齐
+            install_items_for_summary.append({
+                "id": prefixed_key,
+                "payment_clause": item["payment_clause"],
+                "context_ref": context_ref,  # 1-based，指向 chunk_text_map 中的上下文编号
+                "payment_type": item["payment_type"],
+                'init_amount': item['payment_amount'],
+                "init_ratio": f"{round(item['payment_ratio']*100, 2)}%" if item["payment_ratio"] is not None else None
+            })
+        else:
+            logger.warning(
+                f"{_NODE_TAG} 路由[sub_clause_index={item.get('sub_clause_index')}] 未匹配分类，"
+                f"clause_class={item.get('clause_class')}，已丢弃"
+            )
+    
+    if not items_for_summary and not install_items_for_summary:
+        logger.warning("初步提取后没有可供复核的支付条款。")
+        return {"payment_infos": [], "current_step": "payment_info_success", "paragraphs": all_paragraphs}
+
+    payment_info_extractor_node.emit_running(
+        f"初步提取完成，准备对 {len(items_for_summary)+len(install_items_for_summary)} 条款进行批量复核...", 
+        config, 
+        progress=60
+    )
+ 
+    # 组织复核上下文（质保已在上方单独抽取），准备批量复核
+    summary_extractor = await get_summary_extractor(state.get("llm_config"))
+    batch_payment_items_str = json.dumps(items_for_summary, ensure_ascii=False)
+    batch_install_payment_items_str = json.dumps(install_items_for_summary, ensure_ascii=False)
+
+    await DebugHelper.save_snapshot(
+        doc_id=state['document_id'], step_name="rag-llm_stage1",
+        content={
+            "equipment_stage1": items_for_summary,
+            "install_stage1": install_items_for_summary,
+            "merged_equipment_contexts": equip_merged_contexts,
+            "merged_install_contexts": install_merged_contexts,
+            "equip_context_refs": equip_context_refs,
+            "install_context_refs": install_context_refs,
+        },
+        is_debug_enabled = is_debug_mode
+    )
+    summary_result, thinking_info= await summary_extractor.extract_summary(batch_payment_items_str, batch_install_payment_items_str, chunk_text_map, all_equipment_rag_examples, all_installation_rag_examples)
+    # 添加结果校验步骤--
+    logger.info("开始执行结果校验步骤...")
+    payment_info_extractor_node.emit_running(
+        f"正在对提取结果进行校验...", 
+        config, 
+        progress=70
+    )
+    # 调用校验函数
+    validated_summary_result, validated_thinking_info, dedup_removed_ids = await _validate_extraction_results(
+        summary_result,
+        thinking_info,
+        llm_config=state.get("llm_config"),
+    )
+    summary_result = validated_summary_result
+    # S3：校验阶段若产出了新的 thinking，覆盖前一阶段；否则保留 extract_summary 的 thinking
+    if validated_thinking_info is not None:
+        thinking_info = validated_thinking_info
+
+    logger.debug(f"{_NODE_TAG} 批量复核LLM输出条数: {len(summary_result) if summary_result else 0}")
+    logger.debug(f"{_NODE_TAG} 思考过程长度: {len(thinking_info.thinking_output) if thinking_info else 0}")
+
+    final_payment_infos: List[PaymentInfo] = []
+    final_thinking_info: Optional[ThinkingInfo] = thinking_info
+
+    # 【核心修改】在最终循环创建 PaymentInfo 对象时
+    processed_ids: set = set()  # 防止同一 id 被重复处理（如 LLM 将一个 id 拆成多个节点）
+    for idx, reviewed_item in enumerate(summary_result):
+        item_id = getattr(reviewed_item, 'id', None)
+        logger.debug(
+            f"{_NODE_TAG} 回溯 idx={idx}, item_id={repr(item_id)}, "
+            f"in_key={item_id in summary_key_to_initial_item if item_id else 'N/A'}, "
+            f"processed={len(processed_ids)}"
+        )
+
+        if item_id and item_id in summary_key_to_initial_item:
+            if item_id in processed_ids:
+                logger.debug(f"{_NODE_TAG} id={item_id} 已处理过，跳过重复条目（LLM拆分产生）")
+                continue
+            processed_ids.add(item_id)
+            initial_item = summary_key_to_initial_item[item_id]
+        elif item_id:
+            # ID 不匹配（常见于9B模型将输入ID重新顺序编号）
+            # H6：更严格的回退策略 —— 子串包含 > 前缀精确匹配(长度相近) > 高相似度(>=0.85 且 长度相近)
+            reviewed_clause_text = str(getattr(reviewed_item, 'payment_clause', '') or '').strip()
+            fallback_key = None
+            fallback_item = None
+            best_sim = 0.0
+            if reviewed_clause_text:
+                reviewed_prefix = reviewed_clause_text[:30]
+                reviewed_len = len(reviewed_clause_text)
+                for map_key, map_item in summary_key_to_initial_item.items():
+                    if map_key in processed_ids:
+                        continue
+                    map_clause = str(map_item.get('payment_clause', '') or '').strip()
+                    if not map_clause:
+                        continue
+                    # 优先级1：完整子串包含（精确匹配，直接采用）
+                    if map_clause in reviewed_clause_text or reviewed_clause_text in map_clause:
+                        fallback_key = map_key
+                        fallback_item = map_item
+                        best_sim = 1.0
+                        break
+                    # 优先级2：前缀匹配（前30字符相同 且 长度差异 < 40%）
+                    map_prefix = map_clause[:30]
+                    map_len = len(map_clause)
+                    length_ratio = min(reviewed_len, map_len) / max(reviewed_len, map_len, 1)
+                    if (
+                        len(reviewed_prefix) >= 10
+                        and reviewed_prefix == map_prefix
+                        and length_ratio >= 0.6
+                    ):
+                        fallback_key = map_key
+                        fallback_item = map_item
+                        best_sim = 0.95
+                        break
+                    # 优先级3：相似度计算（阈值提升至 0.85 且 长度差异 < 30%）
+                    if length_ratio < 0.7:
+                        continue
+                    sim = _calculate_similarity(reviewed_clause_text, map_clause)
+                    if sim > best_sim and sim >= 0.85:
+                        best_sim = sim
+                        fallback_key = map_key
+                        fallback_item = map_item
+            if fallback_item:
+                logger.warning(
+                    f"复核结果 id={item_id} 不在映射表中，按文本回退匹配到 key={fallback_key}（相似度={best_sim:.2f}），继续处理"
+                )
+                processed_ids.add(fallback_key)
+                item_id = fallback_key
+                initial_item = fallback_item
+            else:
+                logger.warning(
+                    f"复核结果中有无法匹配的项（ID和文本均未命中）: id={item_id}, "
+                    f"category={getattr(reviewed_item, 'clause_category', '')}, "
+                    f"clause={reviewed_clause_text[:80]}"
+                )
+                continue
+        else:
+            logger.warning(f"复核结果中有无id字段的项: category={getattr(reviewed_item, 'clause_category', '')}, clause={str(getattr(reviewed_item, 'payment_clause', ''))[:80]}")
+            continue
+            
+        final_ratio_str = getattr(reviewed_item, 'final_ratio', None)
+        final_payment_type = getattr(reviewed_item, 'payment_type', initial_item['payment_type'])
+
+        # 获取 sub_clause_index（用于标识原始条款）
+        sub_clause_index = initial_item.get('sub_clause_index')
+
+        if final_payment_type and final_ratio_str:
+            try:
+                ratio_str = str(final_ratio_str).strip() if final_ratio_str else ""
+                if not ratio_str:
+                    logger.warning(f"final_ratio_str为空或无效: '{final_ratio_str}' for item_id '{item_id}'")
+                    continue
+                ratio_val = float(ratio_str.replace('%', '')) / 100.0
+
+                # M7：集中化归一化——将中文分类映射到英文Literal值
+                clause_class_list = initial_item.get('clause_class', [])
+                raw_category = clause_class_list[0] if clause_class_list else None
+                canonical = normalize_clause_class(raw_category) if raw_category else None
+                clause_category = "installation_payment" if canonical == "installation_payment" else "equipment_payment"
+
+                # 安装侧 payment_type 白名单兜底：LLM 可能透传设备节点（如"预付款"），强制映射为安装合法节点
+                if clause_category == "installation_payment":
+                    _normalized_pt, _pt_action = enforce_install_payment_type(final_payment_type)
+                    if _pt_action == "mapped":
+                        logger.info(
+                            f"{_NODE_TAG} 安装侧 payment_type 强制映射: "
+                            f"{final_payment_type} → {_normalized_pt} (item_id={item_id})"
+                        )
+                        final_payment_type = _normalized_pt
+                    elif _pt_action == "dropped":
+                        logger.warning(
+                            f"{_NODE_TAG} 安装侧 payment_type 非法已丢弃: "
+                            f"'{final_payment_type}' (item_id={item_id})"
+                        )
+                        continue
+
+                info = PaymentInfo(
+                    clause_category=clause_category,
+                    payment_clause=initial_item['payment_clause'],
+                    payment_context=initial_item.get('clause_context', ''),
+                    payment_type=final_payment_type,
+                    payment_ratio=round(ratio_val, 4),
+                    payment_amount=initial_item.get('payment_amount'),
+                    image_url=None,
+                    first_page_image_url=None,
+                )
+                final_payment_infos.append(info)
+                logger.success(f"成功创建复核后的PaymentInfo: 分类='{info.clause_category}', 类型='{info.payment_type}', 比例={info.payment_ratio}, 金额={info.payment_amount}")
+            except (ValueError, TypeError) as e:
+                logger.error(f"解析复核后的比例失败: '{final_ratio_str}' for item_id '{item_id}'. Error: {e}", exc_info=True)
+            except Exception as e:
+                logger.error(f"创建PaymentInfo对象时发生错误: {e} for item_id '{item_id}'. initial_item keys: {list(initial_item.keys()) if isinstance(initial_item, dict) else 'N/A'}", exc_info=True)
+        else:
+            logger.warning(f"复核结果中缺少必要信息: payment_type='{final_payment_type}', final_ratio='{final_ratio_str}' for item_id '{item_id}'")
+
+    # 方向1：未匹配条款恢复——检查映射表中未被 processed_ids 处理的条款，用原始数据兜底
+    #        排除被去重有意移除的 ID，防止去重结果被恢复逻辑撤销
+    unprocessed_keys = set(summary_key_to_initial_item.keys()) - processed_ids - dedup_removed_ids
+    if unprocessed_keys:
+        logger.warning(f"发现 {len(unprocessed_keys)} 个条款未被 LLM 复核结果匹配到，尝试用初步提取结果恢复: {unprocessed_keys}")
+        for key in unprocessed_keys:
+            item = summary_key_to_initial_item[key]
+            orig_ratio = item.get('payment_ratio')
+            orig_type = item.get('payment_type')
+            orig_clause = item.get('payment_clause', '')
+            
+            if not orig_type or orig_ratio is None:
+                logger.warning(f"  跳过恢复 key={key}：原始数据缺少 payment_type 或 payment_ratio")
+                continue
+            
+            # 跳过 0 元条款（LLM 有意丢弃的无效条款）
+            orig_amount_str = str(item.get('payment_amount', '') or '')
+            orig_amount_clean = orig_amount_str.replace('元', '').replace(',', '').strip()
+            is_zero_amount = orig_amount_clean in ('0', '0.0', '0.00', '')
+            is_zero_in_clause = any(z in orig_clause for z in ('零元', 'RMB0', 'RMB 0', '0元'))
+            if is_zero_amount and is_zero_in_clause:
+                logger.info(f"  跳过恢复 key={key}：0 元条款，LLM 已有意丢弃")
+                continue
+            
+            # M7：集中化归一化——从 clause_class 推导 clause_category
+            clause_class_list = item.get('clause_class', [])
+            raw_cat = clause_class_list[0] if clause_class_list else ''
+            canonical = normalize_clause_class(raw_cat) if raw_cat else None
+            clause_category = "installation_payment" if canonical == "installation_payment" else "equipment_payment"
+
+            # 安装侧 payment_type 白名单兜底（与批量复核回溯保持一致）
+            if clause_category == "installation_payment":
+                _normalized_pt, _pt_action = enforce_install_payment_type(orig_type)
+                if _pt_action == "mapped":
+                    logger.info(
+                        f"{_NODE_TAG} 恢复分支安装侧 payment_type 强制映射: "
+                        f"{orig_type} → {_normalized_pt} (key={key})"
+                    )
+                    orig_type = _normalized_pt
+                elif _pt_action == "dropped":
+                    logger.warning(
+                        f"  跳过恢复 key={key}：安装侧 payment_type 非法 '{orig_type}'"
+                    )
+                    continue
+
+            # 跳过同 category 下已存在相同 payment_type 的条款（LLM 已有意去重）
+            existing_types = {(info.clause_category, info.payment_type) for info in final_payment_infos}
+            if (clause_category, orig_type) in existing_types:
+                logger.info(f"  跳过恢复 key={key}：同类别下已存在 payment_type='{orig_type}'，LLM 已有意去重")
+                continue
+
+            # I7：仅当"同类别 + 同 payment_type + 相似条款文本"三者同时满足时才跳过恢复。
+            # 混签场景下不同子节点会共用整段 payment_clause（相似度 ≈ 1.0），
+            # 必须叠加 payment_type 维度才能避免误杀。LLM 主动改写场景通常保留原 payment_type，
+            # 故此判定仍可挡住"原节点被改写后再被恢复分支塞回"的回流。
+            already_present = False
+            for info in final_payment_infos:
+                if info.clause_category != clause_category:
+                    continue
+                if (info.payment_type or "") != (orig_type or ""):
+                    continue
+                existing_clause = info.payment_clause or ""
+                if not existing_clause or not orig_clause:
+                    continue
+                if existing_clause == orig_clause:
+                    already_present = True
+                    break
+                if existing_clause in orig_clause or orig_clause in existing_clause:
+                    already_present = True
+                    break
+                if _calculate_similarity(existing_clause, orig_clause) >= 0.85:
+                    already_present = True
+                    break
+            if already_present:
+                logger.info(
+                    f"  跳过恢复 key={key}：同类别 + 同 payment_type='{orig_type}' + 相似条款文本，LLM 已主动剔除/改写"
+                )
+                continue
+            
+            try:
+                info = PaymentInfo(
+                    clause_category=clause_category,
+                    payment_clause=orig_clause,
+                    payment_context=item.get('clause_context', ''),
+                    payment_type=orig_type,
+                    payment_ratio=round(float(orig_ratio), 4) if orig_ratio is not None else 0.0,
+                    payment_amount=item.get('payment_amount'),
+                    image_url=None,
+                    first_page_image_url=None,
+                )
+                final_payment_infos.append(info)
+                logger.warning(
+                    f"  恢复条款 key={key}: 类型='{orig_type}', 比例={orig_ratio}, "
+                    f"条款='{orig_clause[:60]}...'"
+                )
+            except Exception as e:
+                logger.error(f"  恢复条款 key={key} 时创建 PaymentInfo 失败: {e}")
+
+    # H8：思考过程仅通过返回值透传，不再直接 mutate state
+    if thinking_info:
+        logger.success(f"{_NODE_TAG} 成功提取思考过程信息: {len(thinking_info.thinking_output)} 字符")
+    else:
+        logger.warning(f"{_NODE_TAG} 未能提取到思考过程信息")
+
+    logger.success(f"{_NODE_TAG} 支付信息提取完成，共提取 {len(final_payment_infos)} 个支付条款")
+
+    await DebugHelper.save_snapshot(
+        doc_id=state['document_id'], step_name="summary-llm_stage2",
+        content={"payment_infos": final_payment_infos, "warranty_info": final_warranty_info,"thinking_info": final_thinking_info},
+        is_debug_enabled = is_debug_mode
+    )
+    return {
+        "payment_infos": final_payment_infos,
+        "warranty_info": final_warranty_info,
+        "thinking_info": final_thinking_info,
+        "current_step": "payment_info_success",
+        "paragraphs": all_paragraphs
+    }

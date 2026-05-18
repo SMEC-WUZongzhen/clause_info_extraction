@@ -1,0 +1,70 @@
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+# 优先使用清华镜像加速依赖解析和安装
+[[tool.poetry.source]]
+name = "tsinghua"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+priority = "primary"
+
+[tool.poetry]
+name = "service2_payment_extractor"
+version = "1.0.0"
+description = "Service 2 - 付款信息提取微服务"
+authors = [
+    "Zhu Yichen <zhuyichen@smec.com>",
+    "Niu Zihan <niuzihan@smec.com>",
+    "Wu Zongzhen <wuzongzhen@smec.com>"
+]
+readme = "README.md"
+packages = [{ include = "app" }]
+
+[tool.poetry.dependencies]
+python = ">=3.12,<4.0"
+loguru = ">=0.7.3"
+pydantic = ">=2.0.0"
+python-dotenv = ">=1.0.1"
+langchain = ">=0.3.19"
+langgraph = ">=0.2.6"
+langchain-openai = "*"
+langchain-community = "*"
+fastapi = "*"
+uvicorn = { extras = ["standard"], version = "*" }
+gunicorn = "*"
+python-multipart = "*"
+aiofiles = "*"
+httpx = ">=0.27.0"
+langgraph-sdk = ">=0.1.57"
+bce-python-sdk = ">=0.9.35"
+pycryptodome = ">=3.18.0"
+deepmerge = ">=1.1.0"
+jieba = ">=0.42.1"
+rank-bm25 = ">=0.2.2"
+pymilvus = ">=2.4.4"
+grpcio-status = "==1.67.1"
+fuzzywuzzy = ">=0.18.0"
+python-Levenshtein = ">=0.25.1"
+bert-score = ">=0.3.13"
+torch = ">=2.0.0,<2.6.0"
+transformers = ">=4.30.0,<4.50.0"
+
+[tool.poetry.group.dev.dependencies]
+mypy = ">=1.11.1"
+ruff = ">=0.6.1"
+pytest = ">=8.3.5"
+pytest-asyncio = "*"
+
+[tool.poetry.group.observability]
+optional = true
+
+[tool.poetry.group.observability.dependencies]
+prometheus-client = ">=0.20.0"
+opentelemetry-api = ">=1.25.0"
+opentelemetry-sdk = ">=1.25.0"
+opentelemetry-exporter-otlp = ">=1.25.0"
+opentelemetry-instrumentation-fastapi = ">=0.46b0"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["app/tests"]

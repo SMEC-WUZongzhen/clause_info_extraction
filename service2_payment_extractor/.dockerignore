@@ -1,0 +1,55 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Logs & local config (volume mounts)
+logs/
+*.log
+
+# Local .env (BOS-downloaded .env is injected at runtime via --download-env-from-bos)
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# BOS models / assets (downloaded at runtime via LocalModelAssetManager).
+# 同时匹配项目根 resources/models/ 与 app/resources/models/。
+resources/models/
+app/resources/models/
+**/resources/models/
+
+# 调试快照与一次性输出
+debug_output/
+outputs/
+
+# 测试与文档（不参与运行时镜像）
+app/tests/
+tests/
+*.drawio
+*.html
+*.jpg
+*.png
+CODE_REVIEW_*.md
+.comate/
+
+# 保留 .env.example
+!.env.example
