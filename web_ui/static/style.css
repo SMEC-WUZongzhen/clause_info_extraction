@@ -86,6 +86,34 @@ body {
   color: var(--muted);
 }
 
+/* Title rows with action button on the right */
+.card-title-row,
+.section-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.section-title-row {
+  margin: 22px 0 10px;
+}
+.section-title-row .section-title {
+  margin: 0;
+}
+.copy-btn {
+  padding: 6px 12px;
+  font-size: 13px;
+  border: 1px solid var(--primary);
+  background: #fff;
+  color: var(--primary);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background .15s, color .15s;
+  white-space: nowrap;
+}
+.copy-btn:hover:not(:disabled) { background: #eef2ff; }
+.copy-btn:disabled { opacity: .65; cursor: default; }
+
 /* Form */
 .field { margin-bottom: 16px; }
 .field label {

@@ -23,7 +23,9 @@ from app.config.env_config import (
     get_dedupe_thresholds,
     normalize_clause_class,
     enforce_install_payment_type,
+    get_negotiation_reject_keywords,
 )
+from app.config.business_dict import get_business_dict
 from app.utils.debug_helper import DebugHelper
 
 
@@ -38,10 +40,152 @@ def _calculate_similarity(text1: str, text2: str) -> float:
     return SequenceMatcher(None, text1, text2).ratio()
 
 
+# === 比例反算硬规则兜底 ===
+# 业务关键词已迁移至 app/resources/business_dict/v1.yaml；此处仅保留判定函数。
+# 旧的模块级常量 _AUX_FEE_KEYWORDS / _EXPLICIT_RATIO_TOKENS 已删除。
+
+
+def _should_strip_ratio(payment_clause: Optional[str]) -> bool:
+    """判断是否应当强制清空 ratio。
+
+    True：条款原文包含辅助费目（如 保养费 / 指导费）且不含显式比例标记 → 反算结果不可靠，强制清空。
+    False：其他情形（含显式 X% / 百分之 / 不含辅助费目）→ 保留 LLM 输出的 ratio。
+    """
+    if not payment_clause:
+        return False
+    text = str(payment_clause)
+    bd = get_business_dict()
+    has_explicit_ratio = any(token in text for token in bd.synonyms.percent_tokens)
+    if has_explicit_ratio:
+        return False
+    return any(kw in text for kw in bd.aux_fee_keywords)
+
+
+# === 条款有效性验证白名单兜底 ===
+# 关键词与阈值已迁移至业务词典 force_valid 配置；此处仅保留判定函数。
+
+
+def _should_force_valid(clause: Optional[str], clause_class: Optional[List[str]]) -> bool:
+    """判断条款是否应被白名单强制保留为有效。
+
+    用于覆盖 LLM 在"节点名 + 比例 + 非典型支付动词（垫付/退还等）"形态下的 false 输出。
+    支持两种方向：
+      - 关键词在前：如"提货款 95%"
+      - 比例在前：如"余 5%质保金"、"5% 质量保证金"
+    """
+    if not clause:
+        return False
+    text = str(clause)
+    fv = get_business_dict().force_valid
+    if len(text) < fv.min_clause_len:
+        return False
+
+    # 排除关键词命中（在条款原文中匹配，clause_class 标签若可用也参与匹配）
+    haystack = text
+    if clause_class:
+        try:
+            haystack = text + " | " + " ".join(str(c) for c in clause_class)
+        except Exception:
+            haystack = text
+    if any(kw in haystack for kw in fv.exclude_keywords):
+        return False
+
+    # 双向窗口扫描：先找出所有"百分比"出现位置，再判断是否有节点关键词在 ±gap 字符内
+    pct_iter = list(re.finditer(r"\d+(\.\d+)?\s*[%％]", text))
+    if not pct_iter:
+        return False
+    max_kw_len = max(len(kw) for kw in fv.node_keywords)
+    for m in pct_iter:
+        pct_start, pct_end = m.start(), m.end()
+        # 前后各扩展 fv.node_pct_gap + 最长关键词长度
+        win_start = max(0, pct_start - fv.node_pct_gap - max_kw_len)
+        win_end = min(len(text), pct_end + fv.node_pct_gap + max_kw_len)
+        window = text[win_start:win_end]
+        for kw in fv.node_keywords:
+            if kw in window:
+                return True
+    return False
+
+
 # 上下文合并阈值（H1，I9 env 化）：仅在存在前后缀/子串重叠 且 相似度足够高时才合并
 _DEDUPE_THRESHOLDS = get_dedupe_thresholds()
 _CONTEXT_MERGE_SIM_THRESHOLD = _DEDUPE_THRESHOLDS["context_similarity"]
 _CONTEXT_OVERLAP_MIN_LEN = int(_DEDUPE_THRESHOLDS["context_overlap_chars"])
+
+
+# === 复核结果后处理：算术校核 + 零节点清理 ===
+def _amount_appears_in_text(amount_str: Optional[str], text: Optional[str]) -> bool:
+    """判断 amount 数字（如 '1572000' / '1572000.0' / '1,572,000' / '157.2万'）
+    是否能在 text 原文中匹配到。匹配采用"纯数字串包含"判定，容忍：
+      - 千分位逗号（含全角逗号）
+      - 末尾 .0 / .00 等冗余小数
+      - 单位"万元/万"换算（如 amount=1572000，原文写"157.2万元"也算命中）
+    """
+    if not amount_str or not text:
+        return False
+    amt = PaymentRatioExtractor._parse_amount_to_float(amount_str)
+    if amt is None or amt <= 0:
+        return False
+    # 把原文中所有"数字串 + 可选(万元|万)"提取并规整为元
+    nums_in_text: List[float] = []
+    for m in re.finditer(r"(\d[\d,，.]*)\s*(万元|万)?", str(text)):
+        raw = m.group(1).replace(",", "").replace("，", "")
+        # 排除末尾仅是分隔符的情况
+        if not re.search(r"\d", raw):
+            continue
+        try:
+            v = float(raw)
+        except ValueError:
+            continue
+        if m.group(2) in ("万元", "万"):
+            v *= 10000.0
+        nums_in_text.append(v)
+    return any(abs(v - amt) < 0.5 for v in nums_in_text)
+
+
+def _postprocess_final_payment_infos(infos: List[PaymentInfo]) -> List[PaymentInfo]:
+    """对复核后的最终 PaymentInfo 列表做两件事：
+      1) 算术校核：原文不含 % 且 payment_context 中存在唯一数字总价、且 amount==total → 强制 ratio=1.0；
+      2) 零金额清理：amount 解析后==0（含 "0"/"0.00"/"0元"/空字符串）→ 丢弃该节点。
+         适用于含比例但金额标 0 的无效条款（如延保/附件中的 5% 占位条款），
+         也覆盖原 "ratio==0 且 amount==0" 的零节点场景。
+    """
+    if not infos:
+        return infos
+
+    cleaned: List[PaymentInfo] = []
+    pct_tokens = tuple(get_business_dict().synonyms.percent_tokens)
+    for info in infos:
+        clause = info.payment_clause or ""
+        ctx = info.payment_context or ""
+
+        # 1) 算术校核
+        if not any(t in clause for t in pct_tokens):
+            unique_total = PaymentRatioExtractor._extract_unique_total_amount(ctx)
+            amt = PaymentRatioExtractor._parse_amount_to_float(info.payment_amount)
+            if unique_total is not None and amt is not None and abs(amt - unique_total) < 0.5:
+                cur = info.payment_ratio
+                if cur is None or abs(float(cur) - 1.0) > 0.01:
+                    logger.warning(
+                        f"{_NODE_TAG} 复核后算术校核：amt({amt})==total({unique_total})，"
+                        f"强制 ratio=1.0；原值={cur}, 类型={info.payment_type}"
+                    )
+                    info.payment_ratio = 1.0
+
+        # 2) 零金额清理：amount 明确为 0 时丢弃（保留 amount=None 的合法条款，例如纯比例条款）
+        amt_raw = info.payment_amount
+        if amt_raw is not None:
+            amt_str = str(amt_raw).replace("元", "").replace(",", "").replace("，", "").strip()
+            if amt_str in ("0", "0.0", "0.00", "0.000", ""):
+                logger.info(
+                    f"{_NODE_TAG} 删除零金额节点（amount=0）: 类型={info.payment_type}, "
+                    f"ratio={info.payment_ratio}, 原amount={amt_raw}, "
+                    f"原条款={(clause or '')[:60]}..."
+                )
+                continue
+
+        cleaned.append(info)
+    return cleaned
 
 
 def _has_prefix_suffix_overlap(a: str, b: str, min_len: int = _CONTEXT_OVERLAP_MIN_LEN) -> bool:
@@ -634,19 +778,28 @@ async def _process_single_payment_paragraph(
         try:
             compound_index = f"{para_global_idx}.{sub_idx}"
             node_payment_type = node.get("payment_type") or rag_payment_type
+            node_ratio = node.get("ratio")
+            node_amount = node.get("amount")
+            # 硬规则兜底：辅助费目（保养费/指导费等）+ 无显式比例 → 强制清空 ratio
+            if node_ratio is not None and _should_strip_ratio(clause_text):
+                logger.info(
+                    f"[{node_name}] 条款(global_idx:{para_global_idx}, sub:{sub_idx}) "
+                    f"命中辅助费目硬规则，强制清空 ratio（原值={node_ratio}）"
+                )
+                node_ratio = None
             result = {
                 "sub_clause_index": compound_index,
                 "payment_clause": clause_text,
                 "clause_context": current_clauses_chunk,
                 "payment_type": node_payment_type,
-                "payment_amount": node.get("amount"),
-                "payment_ratio": node.get("ratio"),
+                "payment_amount": node_amount,
+                "payment_ratio": node_ratio,
                 "clause_class": type_list,
                 "metadata": {"source": "rag", "created_at": state.get("created_at")},
             }
             logger.success(
                 f"[{node_name}] 条款(global_idx:{para_global_idx}, sub:{sub_idx}) 初步提取完成，"
-                f"类型: {node_payment_type}, 比例: {node.get('ratio')}, 金额: {node.get('amount')}"
+                f"类型: {node_payment_type}, 比例: {node_ratio}, 金额: {node_amount}"
             )
             results.append(result)
         except Exception as e:
@@ -726,6 +879,32 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
         logger.success(f"硬编码预过滤完成：过滤 {_pre_invalid_count} 条，剩余 {len(_pre_filtered_paras)} 条")
     payment_paragraphs = _pre_filtered_paras
 
+    # ---- Fix-1：协商被拒上下文过滤 ----
+    # 当条款的 clause_context 中命中"不予调整"等否决回复关键词时，整条条款被丢弃。
+    # 仅匹配 clause_context（不匹配 clause 本身），避免误杀。
+    _NEG_REJECT_KWS = get_negotiation_reject_keywords()
+    if _NEG_REJECT_KWS:
+        _neg_filtered_paras = []
+        _neg_invalid_count = 0
+        for para in payment_paragraphs:
+            ctx_text = (getattr(para, "clause_context", "") or "")
+            matched_kw = next((kw for kw in _NEG_REJECT_KWS if kw in ctx_text), None)
+            if matched_kw:
+                _neg_invalid_count += 1
+                clause_preview = (para.clause or "").strip()[:80]
+                logger.info(
+                    f"{_NODE_TAG} 协商被拒过滤: context 命中=\"{matched_kw}\", "
+                    f"条款={clause_preview}..."
+                )
+            else:
+                _neg_filtered_paras.append(para)
+        if _neg_invalid_count:
+            logger.success(
+                f"{_NODE_TAG} 协商被拒过滤完成：过滤 {_neg_invalid_count} 条，"
+                f"剩余 {len(_neg_filtered_paras)} 条"
+            )
+        payment_paragraphs = _neg_filtered_paras
+
     logger.info(
         f"{_NODE_TAG} 预过滤后分类统计："
         f"设备={len([p for p in payment_paragraphs if '设备付款条款' in p.clause_class])}, "
@@ -742,40 +921,74 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
     # ========== 步骤1: 条款有效性验证（LLM校验，过滤非付款条款） ==========
 
     def _is_table_or_non_clause(text: str) -> bool:
-        """代码预过滤：识别表格行、分隔线、备注说明等非自然语言条款，无需送入LLM。"""
+        """代码预过滤：识别表格分隔线、纯碎片行、备注说明等非自然语言条款，无需送入LLM。
+
+        注意：表格行本身**不**应被一刀切过滤——很多合同把"付款条件/比例/金额"放在表格列里。
+        仅对以下情形判定为非自然语言：
+        1. 纯分隔线（| --- | --- |）；
+        2. 几乎全空的碎片续行（仅 1 个非空 cell，其余皆 ''）；
+        3. 全为分隔符 / 空 cell 的兜底行；
+        4. 注释/备注开头 且 不含付款关键词。
+        其余多列、含金额/比例/付款语义的真实数据行 → 保留。
+        """
         stripped = text.strip()
+        if not stripped:
+            return True
         # 表格分隔线：| --- | --- | 或 |---|---|
         if re.match(r'^\|[\s\-|]+\|$', stripped):
             return True
-        # 表格数据行：以 | 开头并以 | 结尾，中间有多个 | 分隔
-        if stripped.startswith('|') and stripped.endswith('|') and stripped.count('|') >= 3:
-            return True
+        # 表格行细化判定（以 | 开头/结尾且至少含若干 | 分隔符）
+        if stripped.startswith('|') and stripped.count('|') >= 3:
+            inner = stripped.strip('|')
+            cells = [c.strip() for c in inner.split('|')]
+            non_empty = [c for c in cells if c]
+            # 全部 cell 为空或都是 ---
+            if not non_empty or all(set(c) <= {'-'} for c in non_empty):
+                return True
+            # 几乎全空的碎片续行：仅 1 个非空 cell（剩余皆 ''）
+            if len(non_empty) <= 1 and len(cells) >= 3:
+                return True
+            # 注释/价格组成说明行：首个非空 cell 以"注"开头 且 不含明确支付动作
+            if non_empty[0].lstrip().startswith('注') and not re.search(
+                r'支付|付款|请款', non_empty[0]
+            ):
+                return True
+            # 其他真实数据行（含付款条件/比例/金额）→ 保留
+            return False
         # 备注/说明行——但如果包含付款关键词（付款/支付/比例/%/请款），保留送入LLM
         if re.match(r'^备注\d*[：:]', stripped):
             if not re.search(r'付款|支付|请款|比例|%|％|全额', stripped):
                 return True
         return False
 
-    # 构造待验证的条款列表
-    clauses_to_validate = []
+    # 第一步：物理剔除被代码预过滤的非自然语言条款（表格碎片/分隔线/纯备注等），
+    # 避免它们流入后续抽取阶段（之前的实现仅跳过 LLM 校验调用，但条款仍残留在 payment_paragraphs 中被 LLM 抽取）。
+    _kept_paragraphs: List = []
     prefilter_count = 0
     for i, para in enumerate(payment_paragraphs):
         sc_text = (para.clause or "").strip()
         if not sc_text:
+            prefilter_count += 1
+            logger.info(f"预过滤跳过空条款 ID={i}")
             continue
-        # 代码预过滤：表格行、分隔线、备注等直接跳过
         if _is_table_or_non_clause(sc_text):
             prefilter_count += 1
             logger.info(f"预过滤跳过非自然语言条款 ID={i}: {sc_text[:80]}...")
             continue
+        _kept_paragraphs.append(para)
+    if prefilter_count > 0:
+        logger.info(f"代码预过滤：跳过 {prefilter_count} 条非自然语言/空条款（表格行/分隔线/备注等）")
+    payment_paragraphs = _kept_paragraphs
+
+    # 第二步：构造待校验列表（id 与 payment_paragraphs 的下标一一对应）
+    clauses_to_validate = []
+    for i, para in enumerate(payment_paragraphs):
         clauses_to_validate.append({
-            "id": str(i),                       # 使用全局索引作为唯一 ID
-            "clause": sc_text,
+            "id": str(i),
+            "clause": (para.clause or "").strip(),
             "clause_class": para.clause_class,
             "clause_context": para.clause_context,
         })
-    if prefilter_count > 0:
-        logger.info(f"代码预过滤：跳过 {prefilter_count} 条非自然语言条款（表格行/分隔线/备注等）")
 
     validated_paragraphs = []  # 验证通过的有效条款（此时混签条款仍保留原 clause_class，待步骤1.5路由）
     invalid_count = 0
@@ -815,6 +1028,28 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
 
                 # I3: fail-closed —— 仅当 LLM 显式返回 True 才视为有效
                 is_valid = result.get("is_valid") is True
+
+                # 白名单兜底：原文出现"节点关键词 + 紧邻百分比"形态时，强制保留
+                # 用于救回"提货款 95% + 垫付/退还"这类支付动词非典型的有效条款
+                if not is_valid:
+                    try:
+                        force_valid = _should_force_valid(
+                            clause_input.get("clause"),
+                            clause_input.get("clause_class"),
+                        )
+                    except Exception as _e:
+                        logger.opt(exception=True).warning(
+                            f"白名单兜底判定异常 ID={clause_id}: {_e}"
+                        )
+                        force_valid = False
+                    if force_valid:
+                        original_reason = result.get("reason", "")
+                        logger.info(
+                            f"条款验证白名单强制保留: ID={clause_id}, "
+                            f"LLM原因='{original_reason}', "
+                            f"覆盖原因='原文含 节点+比例，强制保留'"
+                        )
+                        is_valid = True
 
                 # 找到对应的原始 paragraph
                 try:
@@ -1242,6 +1477,7 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
             
         final_ratio_str = getattr(reviewed_item, 'final_ratio', None)
         final_payment_type = getattr(reviewed_item, 'payment_type', initial_item['payment_type'])
+        final_amount_from_summary = getattr(reviewed_item, 'final_amount', None)
 
         # 获取 sub_clause_index（用于标识原始条款）
         sub_clause_index = initial_item.get('sub_clause_index')
@@ -1276,13 +1512,53 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
                         )
                         continue
 
+                # 硬规则兜底：辅助费目（保养费/指导费等）+ 无显式比例 → 强制清空 ratio
+                final_ratio_val: Optional[float] = round(ratio_val, 4)
+                if _should_strip_ratio(initial_item.get('payment_clause', '')):
+                    logger.info(
+                        f"{_NODE_TAG} 复核阶段命中辅助费目硬规则，强制清空 ratio "
+                        f"（item_id={item_id}, 原值={final_ratio_val}）"
+                    )
+                    final_ratio_val = None
+
+                # 金额优先级：summary LLM 的 final_amount（已合并/归并） > 初步抽取的 payment_amount
+                # 例如：per-clause 仅识别到 "调验费5000元"，summary 综合识别到 "5000+3000=8000"。
+                # 但 summary LLM 可能从上下文借金额造成幻觉（例如把合同主体的 1,572,000 元
+                # 回填到原文未写金额的"质保金/竣工款"等节点）。因此覆盖前必须校验：
+                # final_amount 的数字串必须能在 payment_clause 原文中匹配到，否则保持 initial 值。
+                _initial_amount = initial_item.get('payment_amount')
+                _summary_amount_str = (
+                    str(final_amount_from_summary).strip()
+                    if final_amount_from_summary is not None
+                    else ""
+                )
+                if _summary_amount_str and _summary_amount_str.lower() not in ("null", "none", "0", "0.0"):
+                    _clause_text_for_amount = str(initial_item.get('payment_clause', '') or '')
+                    if _amount_appears_in_text(_summary_amount_str, _clause_text_for_amount):
+                        final_amount_val = _summary_amount_str
+                        if str(_initial_amount or "").strip() != _summary_amount_str:
+                            logger.info(
+                                f"{_NODE_TAG} 复核阶段以 summary final_amount 覆盖 initial payment_amount "
+                                f"(item_id={item_id}, initial={_initial_amount} → summary={_summary_amount_str})"
+                            )
+                    else:
+                        # summary 给出的 amount 在原文中找不到对应数字，视为幻觉，拒绝覆盖
+                        logger.warning(
+                            f"{_NODE_TAG} 复核阶段拒绝覆盖：summary final_amount={_summary_amount_str} "
+                            f"未在条款原文出现，保持 initial={_initial_amount} "
+                            f"(item_id={item_id}, clause={_clause_text_for_amount[:50]}...)"
+                        )
+                        final_amount_val = _initial_amount
+                else:
+                    final_amount_val = _initial_amount
+
                 info = PaymentInfo(
                     clause_category=clause_category,
                     payment_clause=initial_item['payment_clause'],
                     payment_context=initial_item.get('clause_context', ''),
                     payment_type=final_payment_type,
-                    payment_ratio=round(ratio_val, 4),
-                    payment_amount=initial_item.get('payment_amount'),
+                    payment_ratio=final_ratio_val,
+                    payment_amount=final_amount_val,
                     image_url=None,
                     first_page_image_url=None,
                 )
@@ -1380,7 +1656,7 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
                     payment_clause=orig_clause,
                     payment_context=item.get('clause_context', ''),
                     payment_type=orig_type,
-                    payment_ratio=round(float(orig_ratio), 4) if orig_ratio is not None else 0.0,
+                    payment_ratio=round(float(orig_ratio), 4) if orig_ratio is not None else None,
                     payment_amount=item.get('payment_amount'),
                     image_url=None,
                     first_page_image_url=None,
@@ -1392,6 +1668,9 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
                 )
             except Exception as e:
                 logger.error(f"  恢复条款 key={key} 时创建 PaymentInfo 失败: {e}")
+
+    # 复核结果后处理：算术校核（amount == 上下文唯一总价 → 100%）+ 零节点清理（ratio==0 且 amount==0 → 删除）
+    final_payment_infos = _postprocess_final_payment_infos(final_payment_infos)
 
     # H8：思考过程仅通过返回值透传，不再直接 mutate state
     if thinking_info:

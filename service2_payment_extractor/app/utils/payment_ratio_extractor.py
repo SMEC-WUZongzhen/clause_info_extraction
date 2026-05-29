@@ -24,6 +24,7 @@ from app.config.prompts_loader import (
     PAYMENT_CLAUSE_CATEGORY_PROMPT,
 )
 from app.config.config import APP_CONFIG
+from app.config.business_dict import get_business_dict
 from app.utils.concurrency import llm_guarded_ainvoke, LLM_CALL_TIMEOUT_SEC
 import json
 import asyncio
@@ -312,30 +313,16 @@ class PaymentRatioExtractor:
         """
         从LLM返回的文本中尝试提取 payment_type。
         当JSON解析完全失败、只能用正则兜底时，尝试从文本语义中识别付款类型。
+
+        正则表已迁移到业务词典 payment_type_regex_fallback。命中即记
+        [fallback_regex_hit] 埋点，便于评估 SFT 模型 JSON 输出稳定后下线该路径。
         """
-        # 按优先级匹配标准付款类型关键词
-        type_patterns = [
-            (r'销售定金', '销售定金'),
-            (r'预付款', '预付款'),
-            (r'提货款', '提货款'),
-            (r'货到工地', '货到工地'),
-            (r'安装后', '安装后'),
-            (r'公司验收', '公司验收后'),
-            (r'当地政府部门验收|政府验收|特种设备验收|技监部门验收|监督检验', '当地政府部门验收后'),
-            (r'结算完成|审价完成', '结算完成'),
-            (r'电梯移交用户|移交用户|交付使用', '电梯移交用户后'),
-            (r'工程整体竣工|竣工', '工程整体竣工'),
-            (r'质保金|质量保证金', '质保金'),
-            (r'进场前|首付|开工前|设备进场前', '进场前（首付）'),
-            (r'进场后|设备进场', '进场后'),
-            (r'移交前', '移交前'),
-            (r'报验前', '报验前'),
-            (r'定金|订金', '定金'),
-            (r'验收款|验收后', '验收后'),
-        ]
-        for pattern, ptype in type_patterns:
-            if re.search(pattern, text):
-                return ptype
+        for item in get_business_dict().payment_type_regex_fallback:
+            if re.search(item.pattern, text):
+                logger.warning(
+                    f"[fallback_regex_hit] pattern={item.pattern!r} -> type={item.type!r}"
+                )
+                return item.type
         return None
     
     def _normalize_node_from_json(self, item: dict) -> Optional[Dict[str, Any]]:
@@ -405,10 +392,16 @@ class PaymentRatioExtractor:
         
         try:
             # 3. 准备RAG示例和提示词
+            #    仅展示"条款文本 + payment_type 参考标签"，不展示具体比例与金额，
+            #    避免 few-shot 数值套用导致的幻觉（详见 doc.md 方案 2.1）
             rag_examples = ""
             if rag_results:
                 for i, item in enumerate(rag_results, 1):
-                    rag_examples += f"# `示例{i}`:\n  ## `条款文本`:\n {item.get('text', '').strip()}\n  ## `标准答案`: `标签`：{item.get('label', '')}； `比例`：{item.get('payment_ratio', '')}； `金额`：{item.get('payment_amount', '')}\n\n"
+                    rag_examples += (
+                        f"# `示例{i}`:\n"
+                        f"  ## `条款文本`:\n {item.get('text', '').strip()}\n"
+                        f"  ## `payment_type 参考标签`：{item.get('label', '')}\n\n"
+                    )
             else:
                 rag_examples = "暂无参考示例"
                         
@@ -432,6 +425,14 @@ class PaymentRatioExtractor:
             
             try:
                 payment_nodes = self._parse_multi_node_response(response_text)
+                # 6.1 比例兜底清理（详见 doc.md 方案 2.3）：
+                # 当 payment_clause 原文不出现 %/％/百分之，
+                # 且不含"余款/尾款/付清/结清"等隐含剩余支付语义，
+                # 且上下文中无明确"唯一总价"标识时，
+                # 强制将 ratio 清空，避免 LLM 借 RAG 示例或上下文比例幻觉填充。
+                payment_nodes = self._enforce_ratio_origin_constraint(
+                    payment_nodes, payment_clause, current_clauses_chunk
+                )
                 for idx, node in enumerate(payment_nodes):
                     logger.success(
                         f"从条款中解析的付款节点[{idx}]: 类型={node.get('payment_type')}, "
@@ -445,6 +446,142 @@ class PaymentRatioExtractor:
         except Exception as e:
             logger.error(f"支付信息抽取失败: {e}", exc_info=True)
             return []
+
+    # === 比例字符必须存在性约束（doc.md 方案 2.3 兜底） ===
+    # 同义词集合已迁移至 app/resources/business_dict/v1.yaml；
+    # 通过 get_business_dict().synonyms.* 访问，避免与 payment_info_extractor_node
+    # 中的同名集合产生分裂真相。
+
+    def _has_unique_total_in_context(self, current_clauses_chunk: Optional[str]) -> bool:
+        """粗略判断上下文中是否存在"唯一明确总价"标记。
+
+        采用保守判定：上下文中至少出现一个总价标记词紧邻数字（含元/万/￥/¥）即视为存在。
+        判定结果偏宽松，避免误清空合理的反算比例；严格的"口径一致"留给 LLM 与上层校验。
+        """
+        if not current_clauses_chunk:
+            return False
+        text = str(current_clauses_chunk)
+        for kw in get_business_dict().synonyms.unique_total_hints:
+            idx = text.find(kw)
+            if idx < 0:
+                continue
+            # 在关键词后 30 字符窗口里搜数字
+            window = text[idx + len(kw): idx + len(kw) + 30]
+            if re.search(r"[¥￥]?\s*\d[\d,，.]*\s*(元|万|万元)?", window):
+                return True
+        return False
+
+    @staticmethod
+    def _parse_amount_to_float(amount: Any) -> Optional[float]:
+        """把节点 amount 字段（可能是 int / float / "5000" / "5,000" / "50万元"）规整为元（float）。
+
+        无法解析或非法值返回 None，调用方据此跳过算术校核。
+        """
+        if amount is None:
+            return None
+        if isinstance(amount, (int, float)) and not isinstance(amount, bool):
+            try:
+                v = float(amount)
+                return v if v > 0 else None
+            except Exception:
+                return None
+        s = str(amount).strip()
+        if not s:
+            return None
+        # 移除逗号 / 全角逗号 / 货币符号 / 空白
+        s_clean = re.sub(r"[,\uff0c¥￥\s]", "", s)
+        m = re.search(r"(\d+(?:\.\d+)?)\s*(万元|万)?", s_clean)
+        if not m:
+            return None
+        try:
+            base = float(m.group(1))
+        except Exception:
+            return None
+        if m.group(2):  # 万 / 万元
+            base *= 10000.0
+        return base if base > 0 else None
+
+    @classmethod
+    def _extract_unique_total_amount(cls, current_clauses_chunk: Optional[str]) -> Optional[float]:
+        """从上下文中提取"唯一数字总价"。
+
+        策略：
+        1) 遍历 `_UNIQUE_TOTAL_HINTS` 中每个提示词，扫描其后 0~50 字符窗口；
+        2) 只接受**带单位（元/万/万元）或货币符号（¥/￥）**的数字，避免"税率13%"等噪声被误抓；
+        3) 把所有命中的数值规整为元；
+        4) 若所有命中值在 0.5 元以内一致 → 返回该值；多种不同值 → 返回 None。
+        """
+        if not current_clauses_chunk:
+            return None
+        text = str(current_clauses_chunk)
+        # 必须带单位的数字捕获：(¥|￥)?数字(元|万|万元)，单位强制存在（前缀或后缀至少一个）
+        # 注意：(?=...) 用前瞻确保单位/货币符号存在但不消耗字符，便于多次匹配
+        num_re = re.compile(
+            r"(?:(?P<cur>[¥￥])\s*)?"
+            r"(?P<num>[0-9][0-9,，.]*)"
+            r"\s*(?P<unit>万元|万|元)?"
+        )
+        candidates: List[float] = []
+        for kw in get_business_dict().synonyms.unique_total_hints:
+            for hit in re.finditer(re.escape(kw), text):
+                window = text[hit.end(): hit.end() + 50]
+                # 在窗口内逐个尝试匹配，跳过无单位且无货币符号的"裸数字"（如 13% 中的 13）
+                for m in num_re.finditer(window):
+                    if not m.group("cur") and not m.group("unit"):
+                        continue  # 既无 ¥ 前缀也无 元/万 后缀 → 噪声，跳过
+                    raw = m.group("num").replace(",", "").replace("，", "")
+                    try:
+                        val = float(raw)
+                    except ValueError:
+                        continue
+                    if m.group("unit") in ("万元", "万"):
+                        val *= 10000.0
+                    if val < 100:
+                        continue
+                    candidates.append(val)
+                    break  # 每个 hint 命中后只取窗口内第一个有效数字
+        if not candidates:
+            return None
+        first = candidates[0]
+        if all(abs(c - first) < 0.5 for c in candidates):
+            return first
+        return None
+
+    def _enforce_ratio_origin_constraint(
+        self,
+        payment_nodes: list,
+        payment_clause: Optional[str],
+        current_clauses_chunk: Optional[str],
+    ) -> list:
+        """初次提取兜底：原文不含 % / 付清语义、且上下文也无唯一总价时，强制清空 ratio。
+
+        注：算术校核（金额 == 唯一总价 → 100%）已移至复核结果解析后统一应用，
+        以避免本步结果被复核 LLM 二次覆盖。
+        """
+        if not payment_nodes:
+            return payment_nodes
+
+        text = str(payment_clause or "")
+        _bd_syn = get_business_dict().synonyms
+        has_pct_token = any(tok in text for tok in _bd_syn.percent_tokens)
+        has_residual = any(tok in text for tok in _bd_syn.residual_tokens)
+        has_unique_total = self._has_unique_total_in_context(current_clauses_chunk)
+
+        if has_pct_token or has_residual or has_unique_total:
+            return payment_nodes
+
+        for node in payment_nodes:
+            ratio_val = node.get("ratio")
+            if ratio_val in (None, "", "null"):
+                continue
+            preview = text.strip().replace("\n", " ")[:60]
+            logger.warning(
+                f"原文无比例字样且不满足反算条件，强制清空 ratio: 原ratio={ratio_val}, "
+                f"原条款={preview}..."
+            )
+            node["ratio"] = None
+        return payment_nodes
+        return payment_nodes
 
     # 为了向后兼容，保留原有的extract_ratio方法
     async def extract_ratio(self, payment_clause: str, payment_type: str, rag_results: list, current_clauses_chunk: str, state: State) -> Optional[float]:

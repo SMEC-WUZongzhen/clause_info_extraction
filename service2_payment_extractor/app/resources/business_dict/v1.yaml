@@ -1,0 +1,164 @@
+# Service 2 业务词典 v1
+# ============================================================================
+# 此文件是付款信息提取服务**所有**业务关键词、节点白名单、跨类映射、过滤词、
+# 同义词的【唯一真相】。代码侧通过 app.config.business_dict.get_business_dict()
+# 加载，prompt 侧通过 app.config.prompts_loader.render() 注入。
+#
+# 修改本文件无需改代码；但任何改动需配套：
+#   1) 启动期一致性自检通过（`assert_consistency_with_prompts`）
+#   2) 跑通 app/tests/test_business_dict.py
+#   3) 用 test_service2_standalone.py 黄金集回归
+# ============================================================================
+version: 1
+
+# --- 同义词集合（消除原代码 H2/H10/H14 三处分裂） ---
+synonyms:
+  # 显式比例语义 token；用于 _should_strip_ratio / _enforce_ratio_origin_constraint /
+  # _postprocess_final_payment_infos 三处统一判定
+  percent_tokens:
+    - "%"
+    - "％"
+    - "百分之"
+    - "百分"
+  # 隐含"剩余支付"语义（PaymentRatioExtractor._enforce_ratio_origin_constraint）
+  residual_tokens:
+    - "付清"
+    - "结清"
+    - "尾款"
+    - "支付余款"
+    - "余款付清"
+    - "余款结清"
+    - "支付剩余"
+    - "剩余款付"
+  # "唯一总价"提示词（PaymentRatioExtractor._has_unique_total_in_context）
+  unique_total_hints:
+    - "合同总价"
+    - "合同总额"
+    - "合同总金额"
+    - "合同金额"
+    - "工程总价"
+    - "工程总额"
+    - "工程款总价"
+    - "工程款总额"
+    - "安装工程款总价"
+    - "安装工程款总额"
+    - "安装费用总计"
+    - "设备费用总计"
+    - "总计"
+    - "总额"
+    - "总价"
+
+# --- 辅助费目硬规则（H1） ---
+# 条款原文同时满足"含辅助费目关键词"且"无显式比例语义"时，强制清空 LLM 推导的 ratio
+aux_fee_keywords:
+  - "保养费"
+  - "免保期保养费"
+  - "指导费"
+
+# --- 条款有效性白名单兜底（H3/H4/H5） ---
+# 用于 _should_force_valid：当 LLM is_valid=false 但条款符合"节点关键词紧邻百分比"
+# 形态，则强制保留为有效
+force_valid:
+  # 条款最小长度，过短的标题碎片直接拒绝兜底
+  min_clause_len: 20
+  # 节点关键词与百分比之间允许的最大字符距离（双向）
+  node_pct_gap: 20
+  # 18 个付款节点关键词
+  node_keywords:
+    - "提货款"
+    - "进度款"
+    - "出货款"
+    - "首付款"
+    - "首期款"
+    - "预付款"
+    - "尾款"
+    - "余款"
+    - "质保金"
+    - "质量保证金"
+    - "定金"
+    - "进场款"
+    - "进场前"
+    - "验收款"
+    - "结算款"
+    - "安装费"
+    - "设备款"
+    - "设备款项"
+  # 11 个排除关键词（命中则不允许 force_valid）
+  exclude_keywords:
+    - "违约金"
+    - "罚款"
+    - "赔偿"
+    - "保函"
+    - "担保函"
+    - "利息"
+    - "利率"
+    - "滞纳金"
+    - "质保期保养预留费"
+    - "保养预留款"
+    - "保养预留费"
+
+# --- 条款预过滤默认关键词（H8，对应 env 变量 CLAUSE_FILTER_KEYWORDS） ---
+clause_filter:
+  default_keywords:
+    - "违约金"
+    - "罚款"
+    - "赔偿损失"
+    - "质保期保养预留费"
+  # 协商被拒关键词：在 clause_context（条款周边文本）中命中即丢弃整条条款。
+  # 用于过滤"可否修改 / 建议调整"类提案在被甲方明确否决（"不予调整"）后仍残留的提案条款。
+  # 仅匹配 clause_context，不匹配 clause 本身，避免误杀。
+  # 保守起见目前仅 1 个关键词，后续视生产数据扩充。
+  negotiation_reject_keywords:
+    - "不予调整"
+
+# --- 安装侧节点白名单与跨类映射（H6/H7） ---
+install:
+  # 12 类标准安装节点
+  payment_type_whitelist:
+    - "定金"
+    - "进场前（首付）"
+    - "进场后"
+    - "移交前"
+    - "报验前"
+    - "公司验收后"
+    - "当地政府部门验收后"
+    - "电梯移交用户后"
+    - "工程整体竣工"
+    - "特殊付款-移交前"
+    - "特殊付款-移交后"
+    - "质保金"
+  # 跨类映射：设备/其他节点 → 安装侧节点；value 必须出现在 payment_type_whitelist
+  cross_mapping:
+    "预付款": "定金"
+    "销售定金": "定金"
+    "提货款": "进场前（首付）"
+    "货到工地": "进场前（首付）"
+    "货到工地款": "进场前（首付）"
+    "出货款": "进场前（首付）"
+    "结算完成": "工程整体竣工"
+    "进场前(首付)": "进场前（首付）"
+    "特殊付款—移交前": "特殊付款-移交前"
+    "特殊付款—移交后": "特殊付款-移交后"
+
+# --- payment_type 正则降级表（H9） ---
+# 仅在 PaymentRatioExtractor JSON 解析三级降级失败时使用；保留以观察命中率，
+# 命中应记 [fallback_regex_hit] 埋点，30 天后命中率 < 0.1% 即可下线。
+# 顺序敏感：先匹配的优先返回。
+payment_type_regex_fallback:
+  - { type: "销售定金", pattern: "销售定金" }
+  - { type: "预付款", pattern: "预付款" }
+  - { type: "提货款", pattern: "提货款" }
+  - { type: "货到工地", pattern: "货到工地" }
+  - { type: "安装后", pattern: "安装后" }
+  - { type: "公司验收后", pattern: "公司验收" }
+  - { type: "当地政府部门验收后", pattern: "当地政府部门验收|政府验收|特种设备验收|技监部门验收|监督检验" }
+  - { type: "结算完成", pattern: "结算完成|审价完成" }
+  - { type: "电梯移交用户后", pattern: "电梯移交用户|移交用户|交付使用" }
+  - { type: "工程整体竣工", pattern: "工程整体竣工|竣工" }
+  - { type: "质保金", pattern: "质保金|质量保证金" }
+  - { type: "进场前（首付）", pattern: "进场前|首付|开工前|设备进场前" }
+  - { type: "进场后", pattern: "进场后|设备进场" }
+  - { type: "移交前", pattern: "移交前" }
+  - { type: "报验前", pattern: "报验前" }
+  - { type: "定金", pattern: "定金|订金" }
+  - { type: "验收后", pattern: "验收款|验收后" }

@@ -48,6 +48,8 @@ python-Levenshtein = ">=0.25.1"
 bert-score = ">=0.3.13"
 torch = ">=2.0.0,<2.6.0"
 transformers = ">=4.30.0,<4.50.0"
+pyyaml = ">=6.0"
+tiktoken = ">=0.7.0"
 
 [tool.poetry.group.dev.dependencies]
 mypy = ">=1.11.1"

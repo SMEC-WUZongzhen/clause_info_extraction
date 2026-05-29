@@ -10,7 +10,9 @@ scripts/
 evaluation/
 
 evaluation_report/
-
+pdf文件
+docs
+tools
 *.log
 **/__pycache__
 **/logs

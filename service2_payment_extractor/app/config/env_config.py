@@ -1,8 +1,11 @@
 # app/config/env_config.py
 
 import os
+import warnings
 from typing import Dict, Any, List, Optional, Tuple
 from functools import lru_cache
+
+from app.config.business_dict import get_business_dict
 
 
 # --- 条款分类中英文名称归一化映射 ---
@@ -34,38 +37,10 @@ def normalize_clause_class(cc: str) -> Optional[str]:
     return None
 
 
-# --- 安装侧 payment_type 白名单与跨类映射（代码层强制兜底，避免 LLM 透传非法节点） ---
-# 安装合同标准节点（12 类）：与 prompts.py 的 _INSTALL_STANDARD_NODES 对齐
-INSTALL_PAYMENT_TYPE_WHITELIST: set = {
-    "定金",
-    "进场前（首付）",
-    "进场后",
-    "移交前",
-    "报验前",
-    "公司验收后",
-    "当地政府部门验收后",
-    "电梯移交用户后",
-    "工程整体竣工",
-    "特殊付款-移交前",
-    "特殊付款-移交后",
-    "质保金",
-}
-
-# 设备/其他节点 → 安装侧节点的强制映射（保持与 prompts.py 跨类映射规则一致）
-INSTALL_PAYMENT_TYPE_CROSS_MAPPING: Dict[str, str] = {
-    "预付款": "定金",
-    "销售定金": "定金",
-    "提货款": "进场前（首付）",
-    "货到工地": "进场前（首付）",
-    "货到工地款": "进场前（首付）",
-    "出货款": "进场前（首付）",
-    "结算完成": "工程整体竣工",
-    # 含别写括号变体的兜底归一化
-    "进场前(首付)": "进场前（首付）",
-    "特殊付款—移交前": "特殊付款-移交前",
-    "特殊付款—移交后": "特殊付款-移交后",
-}
-
+# --- 安装侧 payment_type 白名单与跨类映射 ---
+# 真相已迁移到 app/resources/business_dict/v1.yaml；此处仅保留 enforce_* API 与
+# 兼容性懒代理（旧调用方 import INSTALL_PAYMENT_TYPE_WHITELIST 时仍可获得只读副本，
+# 但会触发 DeprecationWarning）。
 
 def enforce_install_payment_type(payment_type: Optional[str]) -> Tuple[Optional[str], str]:
     """对安装侧 payment_type 做白名单校验与跨类映射兜底。
@@ -80,17 +55,52 @@ def enforce_install_payment_type(payment_type: Optional[str]) -> Tuple[Optional[
     pt = str(payment_type).strip()
     if not pt:
         return None, "dropped"
+    install_cfg = get_business_dict().install
+    whitelist = install_cfg.payment_type_whitelist
+    cross = install_cfg.cross_mapping
     # 1) 已是合法节点
-    if pt in INSTALL_PAYMENT_TYPE_WHITELIST:
+    if pt in whitelist:
         return pt, "kept"
     # 2) 命中跨类映射
-    if pt in INSTALL_PAYMENT_TYPE_CROSS_MAPPING:
-        mapped = INSTALL_PAYMENT_TYPE_CROSS_MAPPING[pt]
-        # 二次校验：映射目标必须在白名单内
-        if mapped in INSTALL_PAYMENT_TYPE_WHITELIST:
+    if pt in cross:
+        mapped = cross[pt]
+        # 二次校验：映射目标必须在白名单内（loader 已强校验，此处兜底）
+        if mapped in whitelist:
             return mapped, "mapped"
     # 3) 兜底丢弃
     return pt, "dropped"
+
+
+# --- 兼容性懒代理：旧调用方 from app.config.env_config import INSTALL_PAYMENT_TYPE_WHITELIST ---
+_DEPRECATED_NAMES = {
+    "INSTALL_PAYMENT_TYPE_WHITELIST",
+    "INSTALL_PAYMENT_TYPE_CROSS_MAPPING",
+    "_DEFAULT_CLAUSE_FILTER_KEYWORDS",
+}
+
+
+def __getattr__(name: str):  # PEP 562
+    if name == "INSTALL_PAYMENT_TYPE_WHITELIST":
+        warnings.warn(
+            "INSTALL_PAYMENT_TYPE_WHITELIST 已迁移至业务词典，请改用 "
+            "app.config.business_dict.get_business_dict().install.payment_type_whitelist",
+            DeprecationWarning, stacklevel=2,
+        )
+        return set(get_business_dict().install.payment_type_whitelist)
+    if name == "INSTALL_PAYMENT_TYPE_CROSS_MAPPING":
+        warnings.warn(
+            "INSTALL_PAYMENT_TYPE_CROSS_MAPPING 已迁移至业务词典，请改用 "
+            "app.config.business_dict.get_business_dict().install.cross_mapping",
+            DeprecationWarning, stacklevel=2,
+        )
+        return dict(get_business_dict().install.cross_mapping)
+    if name == "_DEFAULT_CLAUSE_FILTER_KEYWORDS":
+        warnings.warn(
+            "_DEFAULT_CLAUSE_FILTER_KEYWORDS 已迁移至业务词典 clause_filter.default_keywords",
+            DeprecationWarning, stacklevel=2,
+        )
+        return list(get_business_dict().clause_filter_default_keywords)
+    raise AttributeError(f"module 'app.config.env_config' has no attribute {name!r}")
 
 # --- Helper Functions to safely get typed values from environment variables ---
 def _get(key: str, default: Any = None) -> Any:
@@ -285,16 +295,39 @@ def get_dedupe_thresholds() -> Dict[str, float]:
     }
 
 
-_DEFAULT_CLAUSE_FILTER_KEYWORDS = ["违约金", "罚款", "赔偿损失"]
+_DEFAULT_CLAUSE_FILTER_KEYWORDS_FALLBACK = ("违约金", "罚款", "赔偿损失", "质保期保养预留费")
+
 
 @lru_cache(maxsize=1)
 def get_clause_filter_keywords() -> List[str]:
     """
     从环境变量 CLAUSE_FILTER_KEYWORDS 读取预过滤关键词列表（逗号分隔）。
-    未设置时使用内置默认值；显式设置为空则不过滤。
+    未设置时使用业务词典 clause_filter.default_keywords；显式设置为空则不过滤。
     """
     raw = _get('CLAUSE_FILTER_KEYWORDS')
     if raw is None:
-        return list(_DEFAULT_CLAUSE_FILTER_KEYWORDS)
+        try:
+            return list(get_business_dict().clause_filter_default_keywords)
+        except Exception:
+            # 业务词典加载失败时使用 hardcoded fallback，保证服务可启动
+            return list(_DEFAULT_CLAUSE_FILTER_KEYWORDS_FALLBACK)
+    keywords = [kw.strip() for kw in raw.split(',') if kw.strip()]
+    return keywords
+
+
+@lru_cache(maxsize=1)
+def get_negotiation_reject_keywords() -> List[str]:
+    """Fix-1：协商被拒关键词列表。
+
+    若条款的 clause_context 中命中任一关键词，则该条款应被前置过滤。
+    优先级：env CLAUSE_NEGOTIATION_REJECT_KEYWORDS > 业务词典 > 空列表（关闭规则）。
+    显式设置为空字符串可关闭规则，方便回滚。
+    """
+    raw = _get('CLAUSE_NEGOTIATION_REJECT_KEYWORDS')
+    if raw is None:
+        try:
+            return list(get_business_dict().clause_filter_negotiation_reject_keywords)
+        except Exception:
+            return []
     keywords = [kw.strip() for kw in raw.split(',') if kw.strip()]
     return keywords

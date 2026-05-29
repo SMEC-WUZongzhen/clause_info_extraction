@@ -63,16 +63,20 @@ class PipelineError(Exception):
 # ============================================================
 def _fetch_context_for_items(client: ClauseClassifierClient,
                               items: List[Dict[str, Any]],
-                              chunk_text: str,
+                              full_doc_text: str,
                               max_chars: int) -> None:
-    """为单个 chunk 的 filtered items 并发获取上下文，就地修改。"""
+    """为单个 chunk 的 filtered items 并发获取上下文，就地修改。
+
+    注意：传入的是整份文档的全文（full_doc_text），而非当前 chunk，
+    以便 Service 1 在更完整的语境中定位条款上下文。
+    """
     if not items:
         return
 
     def _one(item):
         text = item.get("text", "")
         try:
-            ctx = client.get_context(text, chunk_text, max_chars=max_chars)
+            ctx = client.get_context(text, full_doc_text, max_chars=max_chars)
             item["context"] = {
                 "context_before": ctx.get("context_before", ""),
                 "context_after": ctx.get("context_after", ""),
@@ -88,11 +92,12 @@ def _fetch_context_for_items(client: ClauseClassifierClient,
 
 def _process_single_chunk(client: ClauseClassifierClient,
                            chunk_text: str,
+                           full_doc_text: str,
                            chunk_idx: int,
                            total_chunks: int,
                            task_id: str,
                            max_chars: int) -> Dict[str, Any]:
-    """单个 chunk：extract → filter → 并发 get_context"""
+    """单个 chunk：extract → filter → 并发 get_context（上下文基于整份文档）"""
     raw = client.extract(chunk_text, task_id=f"{task_id}-chunk{chunk_idx}",
                          llm_timeout=config.LLM_TIMEOUT)
     if raw.get("status") != "success":
@@ -116,7 +121,7 @@ def _process_single_chunk(client: ClauseClassifierClient,
                 continue
             items.append(it)
 
-    _fetch_context_for_items(client, items, chunk_text, max_chars)
+    _fetch_context_for_items(client, items, full_doc_text, max_chars)
 
     # 保留该 chunk 所有原始条款（含非目标类别），用于前端"全部展开"
     raw_lines: List[Dict[str, Any]] = []
@@ -191,6 +196,13 @@ def run_step1(md_bytes: bytes, task_id: str,
     if not chunks:
         return {"paragraphs": [], "all_clauses": []}
 
+    # 整份文档文本：用于 Service 1 上下文查询，避免被分块截断
+    # 使用 utf-8-sig 以兼容可能存在的 BOM；解析失败时回退为各 chunk 拼接
+    try:
+        full_doc_text = md_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        full_doc_text = "\n".join(chunks)
+
     client = ClauseClassifierClient(
         base_url=config.SERVICE1_CONFIG["base_url"],
         timeout=config.SERVICE1_CONFIG["timeout"],
@@ -202,8 +214,8 @@ def run_step1(md_bytes: bytes, task_id: str,
     done_count = 0
     with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as ex:
         future_map = {
-            ex.submit(_process_single_chunk, client, chunk, idx, total_chunks,
-                      task_id, effective_max_chars): idx
+            ex.submit(_process_single_chunk, client, chunk, full_doc_text, idx,
+                      total_chunks, task_id, effective_max_chars): idx
             for idx, chunk in enumerate(chunks, 1)
         }
         for fut in as_completed(future_map):

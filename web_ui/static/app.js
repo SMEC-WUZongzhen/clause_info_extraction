@@ -22,6 +22,7 @@ const els = {
 
 let currentEventSource = null;
 let step1Paragraphs = [];  // 供 Step 2 按 clause 匹配 clause_context
+let lastPaymentItems = []; // 缓存最近一次 Step 2 的付款条款，用于一键复制
 
 // ===== 耗时统计 =====
 const timers = {
@@ -349,6 +350,7 @@ function renderStep2(result) {
     (r) => r.payment_ratio != null || r.payment_clause
   );
   const warrantyItems = extraction.filter((r) => r.warranty != null);
+  lastPaymentItems = paymentItems;
 
   // 付款
   if (paymentItems.length === 0) {
@@ -527,3 +529,80 @@ els.form.addEventListener("submit", async (e) => {
     els.submitBtn.disabled = false;
   }
 });
+
+// ===== 一键复制 =====
+const PAYMENT_CLASS_SET = new Set([
+  "混签付款条款", "设备付款条款", "安装付款条款",
+]);
+
+function tsvEscape(s) {
+  if (s == null) return "";
+  // TSV: 替换制表符与换行，保证粘贴到 Excel 时不破坏列结构
+  return String(s).replace(/\t/g, " ").replace(/\r?\n/g, " ");
+}
+
+function buildTSV(headers, rows) {
+  return [headers.join("\t"), ...rows.map((r) => r.map(tsvEscape).join("\t"))].join("\n");
+}
+
+async function copyText(text, btn) {
+  let ok = false;
+  try {
+    await navigator.clipboard.writeText(text);
+    ok = true;
+  } catch (_) {
+    // 回退：textarea + execCommand
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+    } catch (_) { ok = false; }
+  }
+  if (btn) {
+    const old = btn.dataset.label || btn.textContent;
+    btn.dataset.label = old;
+    btn.textContent = ok ? "已复制 ✓" : "复制失败";
+    btn.disabled = true;
+    setTimeout(() => {
+      btn.textContent = old;
+      btn.disabled = false;
+    }, 1500);
+  }
+}
+
+function copyStep2Payment(btn) {
+  if (!lastPaymentItems.length) { alert("暂无付款条款数据"); return; }
+  const headers = ["类别", "阶段类型", "比例", "金额", "条款原文"];
+  const rows = lastPaymentItems.map((it) => [
+    it.clause_category ?? "",
+    it.payment_type ?? "",
+    it.payment_ratio ?? "",
+    it.payment_amount ?? "",
+    it.payment_clause ?? "",
+  ]);
+  copyText(buildTSV(headers, rows), btn);
+}
+
+function copyStep1Payment(btn) {
+  if (!step1Paragraphs.length) { alert("暂无 Step 1 数据"); return; }
+  const filtered = step1Paragraphs.filter((p) =>
+    (p.clause_class || []).some((c) => PAYMENT_CLASS_SET.has(String(c)))
+  );
+  if (!filtered.length) { alert("无符合条件的付款条款（混签/设备/安装）"); return; }
+  const headers = ["归类后", "条款"];
+  const rows = filtered.map((p) => [
+    (p.clause_class || []).join(", "),
+    p.clause ?? "",
+  ]);
+  copyText(buildTSV(headers, rows), btn);
+}
+
+document.getElementById("copy-step1-payment-btn")
+  ?.addEventListener("click", (e) => copyStep1Payment(e.currentTarget));
+document.getElementById("copy-step2-payment-btn")
+  ?.addEventListener("click", (e) => copyStep2Payment(e.currentTarget));

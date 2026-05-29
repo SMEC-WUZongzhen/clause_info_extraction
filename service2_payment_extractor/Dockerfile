@@ -36,14 +36,23 @@ RUN pip install --no-cache-dir \
         --index-url https://download.pytorch.org/whl/cpu
 
 # 4. Install all other Python dependencies via Poetry.
-#    Poetry 会发现 torch 已就位，跳过重装。
-#    poetry lock --no-update 保证 pyproject.toml 与 poetry.lock 一致：
-#    - 不会升级现有依赖版本（保持可复现）
-#    - 仅同步 lock 文件结构（容忍 pyproject 增加 group / pytest 配置等修改）
+#    不再在构建期执行 `poetry lock --no-update`：构建期改 lock 文件
+#    会破坏可复现构建语义。若 pyproject.toml 与 poetry.lock 不一致，
+#    应在开发机修复并提交，让构建在此处直接失败比静默改 lock 更安全。
 RUN poetry config virtualenvs.create false \
-    && poetry lock --no-update \
     && poetry install --no-interaction --no-ansi --no-root --only main \
         --no-cache
+
+# 5. 兜底强制 CPU 版 torch：
+#    清华镜像（pyproject.toml 中的 primary 源）同步自 PyPI，发布的是带
+#    CUDA 元数据的标准 wheel。其文件名/hash 与 pytorch.org/whl/cpu 不一致，
+#    poetry install 按 lock 校验时可能把第 3 步预装的 CPU 版 torch 覆盖
+#    成 GPU 版，导致镜像膨胀 ~1GB 并引入无谓 CUDA 依赖。
+#    --force-reinstall 保证一定回退到 CPU wheel；
+#    --no-deps 确保只动 torch 自身，不影响 poetry 已装好的依赖树。
+RUN pip install --no-cache-dir --force-reinstall --no-deps \
+        "torch>=2.0.0,<2.6.0" \
+        --index-url https://download.pytorch.org/whl/cpu
 
 
 # --- Stage 2: Runtime ---

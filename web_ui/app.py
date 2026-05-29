@@ -94,9 +94,15 @@ def upload():
 
     if not file or not file.filename:
         return jsonify({"error": "未上传文件"}), 400
-    filename = secure_filename(file.filename) or file.filename
-    if not filename.lower().endswith(".md"):
+    # 扩展名校验须基于原始文件名：secure_filename 会剥离非 ASCII 字符
+    # 并 strip("._") 首尾，导致中文文件名（如 "苏北区域..._.md"）被误判为非 .md
+    original_filename = file.filename
+    if not original_filename.lower().endswith(".md"):
         return jsonify({"error": "仅支持 .md 文件"}), 400
+    filename = secure_filename(original_filename)
+    # 若 secure_filename 把扩展名也剥掉了（纯中文名常见），回退到原始名以保留 .md 后缀
+    if not filename.lower().endswith(".md"):
+        filename = original_filename
     if contract_type not in ALLOWED_CONTRACT_TYPES:
         return jsonify({
             "error": f"contract_type 非法（允许: {sorted(ALLOWED_CONTRACT_TYPES)}）"
@@ -325,7 +331,11 @@ if __name__ == "__main__":
         active = config.SERVICE2_CONFIG
 
     host = _args.host or config.HOST
-    port = _args.port or config.PORT
+    # 端口默认按 --mode 区分：remote=5000，local=5001；用户显式 --port 则覆盖
+    if _args.port is not None:
+        port = _args.port
+    else:
+        port = 5000 if config.SERVICE2_MODE == "remote" else 5001
 
     print("=" * 60)
     print(f"  Service 1 URL : {config.SERVICE1_CONFIG['base_url']}")

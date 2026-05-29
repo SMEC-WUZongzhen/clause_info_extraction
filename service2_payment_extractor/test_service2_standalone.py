@@ -57,7 +57,7 @@ SERVICE2_URL = f"{SERVICE2_CONFIG['base_url']}{SERVICE2_CONFIG['endpoint']}"
 TIMEOUT = SERVICE2_CONFIG["timeout"]
 
 
-OUT_BASE = r"E:\DEMO_CODE\付款条款节点提取服务\clause_agent\test_input_output\payment_service2_line200_context400_v4"
+OUT_BASE = r"E:\DEMO_CODE\付款条款节点提取服务_smec\test_input_output\payment_service2_line300_context700_v9_local_528"
 
 # ===== 测试数据：Service 1 的输出结果 =====
 

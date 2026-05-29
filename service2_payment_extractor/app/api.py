@@ -29,6 +29,8 @@ from app.states.states import Paragraph
 from app.utils.comparison_helper import ComparisonHelper, PaymentStage, ComparisonItem, EvaluationMetrics
 from app.utils.payment_ratio_extractor import get_summary_extractor
 from app.utils.observability import setup_observability
+from app.utils.token_counter import count_tokens, warmup as token_counter_warmup
+from app.config.business_dict import get_business_dict, assert_consistency_with_prompts
 
 
 # =============================================================================
@@ -64,6 +66,27 @@ _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 async def lifespan(app: FastAPI):
     await setup_logging()
     logger.info("--- Service 2 (付款信息提取服务) 启动 ---")
+
+    # ---- P0-3：启动期强制加载业务词典；失败立即拒启 ----
+    try:
+        get_business_dict()
+    except Exception as e:
+        logger.critical(f"业务词典加载失败，进程退出: {e}")
+        raise
+
+    # ---- P0-3：prompt ↔ 业务词典 一致性自检（prod 严格 / dev warning）----
+    try:
+        assert_consistency_with_prompts()
+    except Exception as e:
+        logger.critical(f"业务词典一致性自检失败: {e}")
+        raise
+
+    # ---- P0-4：预热 token encoder ----
+    try:
+        token_counter_warmup()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"token_counter 预热失败（已忽略）: {e}")
+
     app.state.langgraph_app = langgraph_app
 
     # 可选可观测接入（缺依赖/未启用时完全静默）
@@ -237,7 +260,7 @@ def _build_extraction_result(final_state: Dict[str, Any]) -> List[Union[PaymentI
             payment_clause=info_dict.get("payment_clause"),
             payment_context=info_dict.get("payment_context", ""),
             payment_type=info_dict.get("payment_type"),
-            payment_ratio=round(ratio * 100, 2) if ratio is not None else 0.0,
+            payment_ratio=round(ratio * 100, 2) if ratio is not None else None,
             payment_amount=info_dict.get("payment_amount"),
         ))
 
@@ -689,7 +712,7 @@ async def chat_completions(request: OpenAIChatRequest):
 
             # 内部 state 中 payment_ratio 始终为 [0,1] 或 None；统一转百分比后输出
             ratio = info_dict.get("payment_ratio")
-            ratio_pct = round(ratio * 100, 2) if ratio is not None else 0.0
+            ratio_pct = round(ratio * 100, 2) if ratio is not None else None
 
             extraction_result.append({
                 "clause_category": info_dict.get("clause_category"),
@@ -714,6 +737,12 @@ async def chat_completions(request: OpenAIChatRequest):
         # 构建 OpenAI 格式的响应
         result_content = json.dumps(extraction_result, ensure_ascii=False, indent=2)
 
+        # P0-4: 真实 token 计数（tiktoken cl100k_base，失败 fallback 字符比）
+        # prompt 部分包含 system_prompt 与全部 user/system 消息内容
+        prompt_text_for_count = system_prompt + "\n" + combined_content
+        prompt_tokens = count_tokens(prompt_text_for_count)
+        completion_tokens = count_tokens(result_content)
+
         response = OpenAIChatResponse(
             id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
             object="chat.completion",
@@ -727,9 +756,9 @@ async def chat_completions(request: OpenAIChatRequest):
                 )
             ],
             usage={
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
             }
         )
 
