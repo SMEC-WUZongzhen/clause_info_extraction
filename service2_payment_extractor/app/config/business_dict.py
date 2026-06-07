@@ -38,6 +38,10 @@ class _ForceValidCfg(BaseModel):
     exclude_keywords: Tuple[str, ...]
 
 
+class _EquipmentCfg(BaseModel):
+    payment_type_whitelist: FrozenSet[str]
+
+
 class _InstallCfg(BaseModel):
     payment_type_whitelist: FrozenSet[str]
     cross_mapping: Dict[str, str]
@@ -68,6 +72,7 @@ class BusinessDict(BaseModel):
     clause_filter_default_keywords: Tuple[str, ...]
     # Fix-1：协商被拒关键词；YAML 缺该字段时默认空 tuple，等价于关闭规则
     clause_filter_negotiation_reject_keywords: Tuple[str, ...] = ()
+    equipment: _EquipmentCfg
     install: _InstallCfg
     payment_type_regex_fallback: Tuple[_PtRegexItem, ...]
 
@@ -120,7 +125,8 @@ def get_business_dict() -> BusinessDict:
         raise RuntimeError(f"业务词典 schema 校验失败 ({path}): {e}") from e
     logger.info(
         f"[business_dict] 已加载 {path.name} "
-        f"v{bd.version}: install_whitelist={len(bd.install.payment_type_whitelist)} "
+        f"v{bd.version}: equip_whitelist={len(bd.equipment.payment_type_whitelist)} "
+        f"install_whitelist={len(bd.install.payment_type_whitelist)} "
         f"node_kw={len(bd.force_valid.node_keywords)} "
         f"regex_fallback={len(bd.payment_type_regex_fallback)} "
         f"neg_reject_kw={len(bd.clause_filter_negotiation_reject_keywords)}"
@@ -136,7 +142,8 @@ def assert_consistency_with_prompts(strict: Optional[bool] = None) -> None:
     """启动期自检：渲染后的 prompt 文本是否覆盖业务词典关键白名单。
 
     判断规则（保守）：
-      - 12 类 install 白名单中至少 80% 出现在某条相关 prompt 文本中
+      - 设备白名单中至少 80% 出现在设备相关 prompt 文本中
+      - 安装白名单中至少 80% 出现在安装相关 prompt 文本中
       - 跨类映射的 source/target 在 prompt 中出现
     不一致：strict=True 抛 RuntimeError；否则仅 warning。
 
@@ -158,7 +165,36 @@ def assert_consistency_with_prompts(strict: Optional[bool] = None) -> None:
         logger.warning(msg)
         return
 
-    candidate_prompts = [
+    # --- 设备白名单一致性 ---
+    equip_prompts = [
+        getattr(prompts_loader, name, "") or ""
+        for name in (
+            "EQUIPMENT_PAYMENT_RATIO_PROMPT",
+            "PAYMENT_SUMMARY_RATIO_PROMPT",
+        )
+    ]
+    equip_blob = "\n".join(equip_prompts)
+    equip_whitelist = list(bd.equipment.payment_type_whitelist)
+    equip_hits = [w for w in equip_whitelist if w in equip_blob]
+    equip_coverage = len(equip_hits) / max(1, len(equip_whitelist))
+
+    if equip_coverage < 0.8:
+        missing = sorted(set(equip_whitelist) - set(equip_hits))
+        msg = (
+            f"[business_dict] prompt ↔ equipment 白名单一致性不足 "
+            f"({len(equip_hits)}/{len(equip_whitelist)}={equip_coverage:.0%}); 缺失={missing}"
+        )
+        if strict:
+            raise RuntimeError(msg)
+        logger.warning(msg)
+    else:
+        logger.success(
+            f"[business_dict] equipment prompt 一致性自检通过 "
+            f"({len(equip_hits)}/{len(equip_whitelist)}={equip_coverage:.0%})"
+        )
+
+    # --- 安装白名单一致性 ---
+    install_prompts = [
         getattr(prompts_loader, name, "") or ""
         for name in (
             "INSTALL_PAYMENT_RATIO_PROMPT",
@@ -166,25 +202,24 @@ def assert_consistency_with_prompts(strict: Optional[bool] = None) -> None:
             "PAYMENT_CLAUSE_CATEGORY_PROMPT",
         )
     ]
-    blob = "\n".join(candidate_prompts)
+    install_blob = "\n".join(install_prompts)
+    install_whitelist = list(bd.install.payment_type_whitelist)
+    install_hits = [w for w in install_whitelist if w in install_blob]
+    install_coverage = len(install_hits) / max(1, len(install_whitelist))
 
-    whitelist = list(bd.install.payment_type_whitelist)
-    hits = [w for w in whitelist if w in blob]
-    coverage = len(hits) / max(1, len(whitelist))
-
-    if coverage < 0.8:
-        missing = sorted(set(whitelist) - set(hits))
+    if install_coverage < 0.8:
+        missing = sorted(set(install_whitelist) - set(install_hits))
         msg = (
             f"[business_dict] prompt ↔ install 白名单一致性不足 "
-            f"({len(hits)}/{len(whitelist)}={coverage:.0%}); 缺失={missing}"
+            f"({len(install_hits)}/{len(install_whitelist)}={install_coverage:.0%}); 缺失={missing}"
         )
         if strict:
             raise RuntimeError(msg)
         logger.warning(msg)
     else:
         logger.success(
-            f"[business_dict] prompt 一致性自检通过 "
-            f"({len(hits)}/{len(whitelist)}={coverage:.0%})"
+            f"[business_dict] install prompt 一致性自检通过 "
+            f"({len(install_hits)}/{len(install_whitelist)}={install_coverage:.0%})"
         )
 
 

@@ -108,6 +108,11 @@ COPY --chown=appuser:appgroup . .
 # (例如 load_dotenv() 兜底、prompts 热下载等)。
 RUN chown appuser:appgroup /app
 
+# === S2 修复：哨兵层 ===
+# 防御 .dockerignore 漏配；若 .env 仍混入镜像，构建期立即失败而不是发布到产线。
+# 如确需在镜像内提供 .env（例如本地调试），请显式删除该 RUN 行。
+RUN test ! -f /app/.env || (echo "FATAL: .env leaked into image, abort build" >&2 && exit 1)
+
 # Switch to non-root user.
 USER appuser
 

@@ -69,7 +69,7 @@ from app.utils.bos_helper import BosHandler
 from app.config.env_config import (
     get_app_level_config, get_llm_config,get_payment_ratio_llm_config, get_bos_config, get_processing_config
 )
-from app.config.prompts import (
+from app.config.prompts_loader import (
     PAYMENT_RATIO_PROMPT,
     PAYMENT_SUMMARY_RATIO_PROMPT
 )

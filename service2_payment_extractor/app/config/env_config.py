@@ -45,16 +45,18 @@ def normalize_clause_class(cc: str) -> Optional[str]:
 def enforce_install_payment_type(payment_type: Optional[str]) -> Tuple[Optional[str], str]:
     """对安装侧 payment_type 做白名单校验与跨类映射兜底。
 
-    返回 (normalized_payment_type, action)，action ∈ {"kept", "mapped", "dropped"}：
-    - "kept"   : 已在 12 类白名单内，原样保留
-    - "mapped" : 命中跨类映射表，已转换为合法节点
-    - "dropped": 既不在白名单也无法映射，调用方应丢弃该节点
+    返回 (normalized_payment_type, action)，action ∈ {"kept", "mapped", "missing", "dropped"}：
+    - "kept"    : 已在白名单内，原样保留
+    - "mapped"  : 命中跨类映射表，已转换为合法节点
+    - "missing" : 输入为 None / 空字符串（H4 修复：与白名单失败语义区分），
+                  调用方应保留节点本体，仅对 payment_type 字段记录 WARNING
+    - "dropped" : 既不在白名单也无法映射，调用方应丢弃该节点
     """
     if payment_type is None:
-        return None, "dropped"
+        return None, "missing"
     pt = str(payment_type).strip()
     if not pt:
-        return None, "dropped"
+        return None, "missing"
     install_cfg = get_business_dict().install
     whitelist = install_cfg.payment_type_whitelist
     cross = install_cfg.cross_mapping
@@ -122,6 +124,38 @@ def _get_float(key: str, default: float = 0.0) -> float:
     except (ValueError, TypeError):
         return default
 
+
+# =============================================================================
+# H6 修复：必填 env 启动期 fail-closed 校验
+# =============================================================================
+# prod 模式严格校验全量必填项；dev 模式仅要求主 LLM 三件套，避免本地无 Milvus / BOS 时无法启动。
+_REQUIRED_ENV_PROD: Tuple[str, ...] = (
+    "LLM_API_BASE", "LLM_MODEL",
+    "BOS_ACCESS_KEY", "BOS_SECRET_KEY", "BOS_ENDPOINT",
+    "RAG_MILVUS_URI", "RAG_COLLECTION_NAME", "RAG_COLLECTION_NAME_INSTALLATION",
+    "RAG_REMOTE_EMBEDDING_URL", "RAG_REMOTE_EMBEDDING_KEY",
+)
+_REQUIRED_ENV_DEV: Tuple[str, ...] = (
+    "LLM_API_BASE", "LLM_MODEL",
+)
+
+
+def assert_required_env() -> None:
+    """启动期断言必填 env 已配置；缺失即抛 RuntimeError，由 lifespan 捕获后退出。
+
+    - production 模式：校验全量 11 项（LLM / BOS / Milvus / Embedding）
+    - 其它模式：仅校验主 LLM 三件套
+    """
+    env_mode = (_get("ENVIRONMENT", "development") or "development").strip().lower()
+    required = _REQUIRED_ENV_PROD if env_mode == "production" else _REQUIRED_ENV_DEV
+    missing = [k for k in required if not (_get(k) and str(_get(k)).strip())]
+    if missing:
+        raise RuntimeError(
+            f"必填环境变量缺失（mode={env_mode}）：{missing}；请检查 .env 或部署配置"
+        )
+
+
+
 # --- Configuration Loading Functions ---
 # Each function is responsible for loading a specific part of the config from .env
 # Using @lru_cache(maxsize=1) ensures that .env is read only once.
@@ -142,7 +176,8 @@ def get_llm_config() -> Dict[str, Any]:
     if _get('LLM_MAX_TOKENS'): config['max_tokens'] = _get_int('LLM_MAX_TOKENS')
     if _get('LLM_MAX_OUTPUT_TOKENS'): config['max_output_tokens'] = _get_int('LLM_MAX_OUTPUT_TOKENS')
     if _get('LLM_API_BASE'): config['api_base'] = _get('LLM_API_BASE')
-    if _get('LLM_API_KEY'): config['api_key'] = _get('LLM_API_KEY')
+    # api_key 允许为空：百舸等无鉴权网关留空即可，下游会传占位符
+    config['api_key'] = _get('LLM_API_KEY', '') or ''
     if _get('LLM_MODEL'): config['model'] = _get('LLM_MODEL')
     return config
 
@@ -296,6 +331,25 @@ def get_dedupe_thresholds() -> Dict[str, float]:
 
 
 _DEFAULT_CLAUSE_FILTER_KEYWORDS_FALLBACK = ("违约金", "罚款", "赔偿损失", "质保期保养预留费")
+
+
+@lru_cache(maxsize=1)
+def get_failure_rate_threshold() -> float:
+    """H2 修复：抽取阶段失败率阈值。
+
+    当 RAG/LLM 失败段落比例超过此阈值时，节点会把 ``extraction_partial=True``
+    写入 state，API 层据此返回 503 而非 200。默认 0.5。
+    """
+    raw = _get("EXTRACTION_FAILURE_RATE_THRESHOLD")
+    if raw is None or str(raw).strip() == "":
+        return 0.5
+    try:
+        v = float(raw)
+        if 0.0 < v <= 1.0:
+            return v
+    except (TypeError, ValueError):
+        pass
+    return 0.5
 
 
 @lru_cache(maxsize=1)

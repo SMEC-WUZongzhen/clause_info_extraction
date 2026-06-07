@@ -17,19 +17,21 @@ from app.utils.payment_ratio_extractor import (
     get_ratio_extractor,
 )
 from app.utils.node_decorator import node_with_progress
-from app.config.graph_config import WORKFLOW_PROGRESS_RANGES
+from app.config.graph_config import WORKFLOW_PROGRESS_RANGES, EXTRACTOR_STAGE_PROGRESS
 from app.config.env_config import (
     get_clause_filter_keywords,
     get_dedupe_thresholds,
     normalize_clause_class,
     enforce_install_payment_type,
     get_negotiation_reject_keywords,
+    get_failure_rate_threshold,
 )
 from app.config.business_dict import get_business_dict
 from app.utils.debug_helper import DebugHelper
+from app.utils.log_redact import safe_clause
 
 
-# 统一日志前缀，便于 ELK 过滤
+# 统一日志前缀，便于 ELK 过滤；新增日志请一律使用 f"{_NODE_TAG} ..." 前缀。
 _NODE_TAG = "[Service2-Extractor]"
 
 
@@ -180,7 +182,7 @@ def _postprocess_final_payment_infos(infos: List[PaymentInfo]) -> List[PaymentIn
                 logger.info(
                     f"{_NODE_TAG} 删除零金额节点（amount=0）: 类型={info.payment_type}, "
                     f"ratio={info.payment_ratio}, 原amount={amt_raw}, "
-                    f"原条款={(clause or '')[:60]}..."
+                    f"原条款={safe_clause(clause, head=60)}"
                 )
                 continue
 
@@ -325,7 +327,7 @@ def _deduplicate_and_merge_contexts(
     )
     ref_counter = Counter(index_to_ref)
     for ri, mc in enumerate(merged_contexts):
-        logger.debug(f"  上下文[{ri + 1}]（被 {ref_counter[ri]} 条条款引用）: {mc[:100]}...")
+        logger.debug(f"  上下文[{ri + 1}]（被 {ref_counter[ri]} 条条款引用）: {safe_clause(mc, head=100)}")
 
     return merged_contexts, index_to_ref
 
@@ -361,7 +363,7 @@ def _merge_overlapping_strings(a: str, b: str) -> Optional[str]:
     return None
 
 
-def _remove_duplicate_payment_items(payment_items: List[Dict], similarity_threshold: Optional[float] = None) -> List[Dict]:
+def _remove_duplicate_payment_items(payment_items: List[Dict[str, Any]], similarity_threshold: Optional[float] = None) -> List[Dict[str, Any]]:
     """
     去除字符相似度大于阈值的重复支付条款，保留较长的条款
     
@@ -439,21 +441,35 @@ def _remove_duplicate_payment_items(payment_items: List[Dict], similarity_thresh
                     duplicate_reason = f"字符相似度: {similarity:.2f}"
             
             if is_duplicate:
-                # 保留较长的条款，移除较短的
-                if len(text1) >= len(text2):
+                # 优先保留条款原文中实际包含 amount/ratio 的那条（避免幻觉节点胜出）
+                amt_str = amt1 or amt2  # 去重匹配时确认的 amount 值
+                text1_has_evidence = bool(amt_str and amt_str in text1) or bool(re.search(r'\d+%', text1))
+                text2_has_evidence = bool(amt_str and amt_str in text2) or bool(re.search(r'\d+%', text2))
+
+                if text1_has_evidence and not text2_has_evidence:
+                    # text1 有证据，保留 text1
+                    keep_i = True
+                elif text2_has_evidence and not text1_has_evidence:
+                    # text2 有证据，保留 text2
+                    keep_i = False
+                else:
+                    # 都有或都无证据时，保留较长的
+                    keep_i = len(text1) >= len(text2)
+
+                if keep_i:
                     to_remove.add(j)
                     logger.info(f"发现重复条款，原因: {duplicate_reason}")
                     logger.info(f"  保留: IDX={item1.get('sub_clause_index', '')}, 长度={len(text1)}")
                     logger.info(f"  移除: IDX={item2.get('sub_clause_index', '')}, 长度={len(text2)}")
-                    logger.info(f"  条款1: {text1[:150]}...")
-                    logger.info(f"  条款2: {text2[:150]}...")
+                    logger.info(f"  条款1: {safe_clause(text1, head=150)}")
+                    logger.info(f"  条款2: {safe_clause(text2, head=150)}")
                 else:
                     to_remove.add(i)
                     logger.info(f"发现重复条款，原因: {duplicate_reason}")
                     logger.info(f"  保留: IDX={item2.get('sub_clause_index', '')}, 长度={len(text2)}")
                     logger.info(f"  移除: IDX={item1.get('sub_clause_index', '')}, 长度={len(text1)}")
-                    logger.info(f"  条款1: {text1[:150]}...")
-                    logger.info(f"  条款2: {text2[:150]}...")
+                    logger.info(f"  条款1: {safe_clause(text1, head=150)}")
+                    logger.info(f"  条款2: {safe_clause(text2, head=150)}")
                     break  # 当前条款被移除，跳出内层循环
     
     # 移除标记的条款
@@ -463,7 +479,7 @@ def _remove_duplicate_payment_items(payment_items: List[Dict], similarity_thresh
     return result
 
 
-def _enforce_unique_payment_type(items: List[Any]) -> List[Any]:
+def _enforce_unique_payment_type(items: List[PaymentInfo]) -> List[PaymentInfo]:
     """
     代码级强制去重：确保同一 clause_category 下每个 payment_type 只保留一个条款。
     当存在重复时，按以下优先级选择最优条款：
@@ -505,7 +521,7 @@ def _enforce_unique_payment_type(items: List[Any]) -> List[Any]:
     return result
 
 
-def _pick_best_clause(candidates: List[Any]) -> Any:
+def _pick_best_clause(candidates: List[PaymentInfo]) -> Optional[PaymentInfo]:
     """从多个同 payment_type 的条款中选出最优的一个。"""
 
     def _score(item) -> tuple:
@@ -525,7 +541,7 @@ async def _validate_extraction_results(
     summary_result: List[Any],
     thinking_info: Optional[Any],
     llm_config: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[Any], Optional[Any], set]:
+) -> Tuple[List[Any], Optional[Any], Set[str]]:
     """
     对提取结果进行校验的辅助函数。
     使用与extract_summary相同的LLM实现进行二次校验。
@@ -689,14 +705,14 @@ async def _process_single_payment_paragraph(
     支持从单个条款中提取多个付款节点（如分期付款条款包含多个独立付款动作）。
     返回: (初步提取信息字典列表, 设备RAG示例列表, 安装RAG示例列表)
     """
-    node_name = "payment_info_extractor"
+    node_name = "payment_info_extractor"  # 兼容历史，新代码请直接用 _NODE_TAG
     results = []
     equipment_rag_examples = []
     installation_rag_examples = []
 
     clause_text = (para.clause or "").strip()
     if not clause_text:
-        logger.warning(f"[{node_name}] 段落(global_idx:{para_global_idx}) 无有效条款文本，跳过。")
+        logger.warning(f"{_NODE_TAG} 段落(global_idx:{para_global_idx}) 无有效条款文本，跳过。")
         return results, equipment_rag_examples, installation_rag_examples
 
     # 从 clause_class 推导英文类型（M7：使用集中化的 normalize_clause_class）
@@ -712,7 +728,7 @@ async def _process_single_payment_paragraph(
     if not type_list:
         type_list = ["equipment_payment"]
 
-    logger.debug(f"[{node_name}] 开始处理条款 (global_idx:{para_global_idx})...")
+    logger.debug(f"{_NODE_TAG} 开始处理条款 (global_idx:{para_global_idx})...")
 
     # M4：错误分层，便于定位哪一步失败
     # --- RAG 阶段 ---
@@ -720,14 +736,21 @@ async def _process_single_payment_paragraph(
         rag_result = await retrieve_payment_type(clause_text, type_list)
     except Exception as e:
         logger.error(
-            f"[{node_name}][RAG失败] 条款(global_idx:{para_global_idx}) RAG 检索异常: {e}",
+            f"{_NODE_TAG}[RAG失败] 条款(global_idx:{para_global_idx}) RAG 检索异常: {e}",
             exc_info=True,
         )
+        # H2 修复：把失败信息上报到 state，便于节点末端做失败率裁决
+        state.setdefault("_extraction_errors", []).append({
+            "stage": "rag",
+            "paragraph_idx": para_global_idx,
+            "error_type": type(e).__name__,
+            "error": str(e)[:200],
+        })
         return results, equipment_rag_examples, installation_rag_examples
 
     final_rag_results = rag_result.get("final_results", [])
     if not final_rag_results:
-        logger.warning(f"[{node_name}] 条款(global_idx:{para_global_idx}) RAG未召回，跳过。")
+        logger.warning(f"{_NODE_TAG} 条款(global_idx:{para_global_idx}) RAG未召回，跳过。")
         return results, equipment_rag_examples, installation_rag_examples
 
     # RAG投票获取参考类型（仅作为LLM输入的参考，不再作为最终类型）
@@ -739,10 +762,10 @@ async def _process_single_payment_paragraph(
 
     if label_counts:
         rag_payment_type = max(label_counts.items(), key=lambda x: x[1])[0]
-        logger.debug(f"[{node_name}] RAG类别统计: {label_counts}, 参考类型: {rag_payment_type}")
+        logger.debug(f"{_NODE_TAG} RAG类别统计: {label_counts}, 参考类型: {rag_payment_type}")
     else:
         rag_payment_type = "未知类型"
-        logger.warning(f"[{node_name}] RAG 结果无有效类别标签，使用默认值")
+        logger.warning(f"{_NODE_TAG} RAG 结果无有效类别标签，使用默认值")
 
     # --- LLM 提取阶段 ---
     try:
@@ -760,17 +783,24 @@ async def _process_single_payment_paragraph(
         )
     except Exception as e:
         logger.error(
-            f"[{node_name}][LLM失败] 条款(global_idx:{para_global_idx}) 付款信息提取异常: {e}",
+            f"{_NODE_TAG}[LLM失败] 条款(global_idx:{para_global_idx}) 付款信息提取异常: {e}",
             exc_info=True,
         )
+        # H2 修复：上报 LLM 阶段失败
+        state.setdefault("_extraction_errors", []).append({
+            "stage": "llm",
+            "paragraph_idx": para_global_idx,
+            "error_type": type(e).__name__,
+            "error": str(e)[:200],
+        })
         return results, equipment_rag_examples, installation_rag_examples
 
     if not payment_nodes:
-        logger.warning(f"[{node_name}] 条款(global_idx:{para_global_idx}) LLM未提取到有效付款节点。")
+        logger.warning(f"{_NODE_TAG} 条款(global_idx:{para_global_idx}) LLM未提取到有效付款节点。")
         return results, equipment_rag_examples, installation_rag_examples
 
     logger.info(
-        f"[{node_name}] 条款(global_idx:{para_global_idx}) 识别到 {len(payment_nodes)} 个付款节点"
+        f"{_NODE_TAG} 条款(global_idx:{para_global_idx}) 识别到 {len(payment_nodes)} 个付款节点"
     )
 
     # --- 解析/构造阶段（M2：sub_clause_index 统一为 "i.s" 字符串） ---
@@ -783,7 +813,7 @@ async def _process_single_payment_paragraph(
             # 硬规则兜底：辅助费目（保养费/指导费等）+ 无显式比例 → 强制清空 ratio
             if node_ratio is not None and _should_strip_ratio(clause_text):
                 logger.info(
-                    f"[{node_name}] 条款(global_idx:{para_global_idx}, sub:{sub_idx}) "
+                    f"{_NODE_TAG} 条款(global_idx:{para_global_idx}, sub:{sub_idx}) "
                     f"命中辅助费目硬规则，强制清空 ratio（原值={node_ratio}）"
                 )
                 node_ratio = None
@@ -798,13 +828,13 @@ async def _process_single_payment_paragraph(
                 "metadata": {"source": "rag", "created_at": state.get("created_at")},
             }
             logger.success(
-                f"[{node_name}] 条款(global_idx:{para_global_idx}, sub:{sub_idx}) 初步提取完成，"
+                f"{_NODE_TAG} 条款(global_idx:{para_global_idx}, sub:{sub_idx}) 初步提取完成，"
                 f"类型: {node_payment_type}, 比例: {node_ratio}, 金额: {node_amount}"
             )
             results.append(result)
         except Exception as e:
             logger.error(
-                f"[{node_name}][解析失败] 条款(global_idx:{para_global_idx}, sub:{sub_idx}) 构造结果异常: {e}",
+                f"{_NODE_TAG}[解析失败] 条款(global_idx:{para_global_idx}, sub:{sub_idx}) 构造结果异常: {e}",
                 exc_info=True,
             )
             continue
@@ -823,6 +853,28 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
     logger.info("=" * 50)
     logger.info("PAYMENT_INFO_EXTRACTOR_NODE 开始执行...")
     logger.info("=" * 50)
+    # =========================================================================
+    # H1 修复（阶段标注，第一阶段）
+    # -------------------------------------------------------------------------
+    # 本节点函数较长（870+ 行），按时间线划分为以下 12 个阶段。
+    # 后续 P1 重构将把每个 `=== STAGE: xxx ===` 段抽成命名 `_stage_*` 私有协程，
+    # 主节点只负责编排 + 错误聚合（参见 doc.md / tasks.md 规划）。
+    # 当前阶段：仅在阶段起点插入显式标注，便于阅读与精准 diff，不改动业务行为。
+    #
+    # 阶段索引（与 EXTRACTOR_STAGE_PROGRESS 字典对齐）：
+    #   1. prefilter            - 预过滤 + 协商被拒过滤
+    #   2. validate             - 条款有效性 LLM 校验（progress=5）
+    #   3. resolve_mixed        - 混签条款归属判定（progress=8）
+    #   4. warranty             - 质保期单独抽取
+    #   5. concurrent_extract   - 并发 RAG + LLM 抽取（progress=20）
+    #   6. strict_dedupe        - 字符串严格去重
+    #   7. merge_contexts       - 上下文 DSU 去重合并
+    #   8. summary_review       - 批量复核（progress=60）
+    #   9. dedupe_review        - 单组去重 LLM
+    #  10. result_verify        - _validate_extraction_results（progress=70）
+    #  11. recovery_fallback    - 兜底恢复（白名单/硬规则）
+    #  12. postprocess          - 算术校核 + 零金额清理
+    # =========================================================================
 
     configurable_config = config.get("configurable", {}) if config else {}
     is_debug_mode = configurable_config.get("debug_mode", False)
@@ -872,7 +924,7 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
         matched_kw = next((kw for kw in _INVALID_KEYWORDS if kw in clause_text), None)
         if matched_kw:
             _pre_invalid_count += 1
-            logger.info(f"硬编码预过滤: 命中关键词=\"{matched_kw}\", 条款={clause_text[:80]}...")
+            logger.info(f"{_NODE_TAG} 硬编码预过滤: 命中关键词=\"{matched_kw}\", 条款={safe_clause(clause_text, head=80)}")
         else:
             _pre_filtered_paras.append(para)
     if _pre_invalid_count:
@@ -891,10 +943,10 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
             matched_kw = next((kw for kw in _NEG_REJECT_KWS if kw in ctx_text), None)
             if matched_kw:
                 _neg_invalid_count += 1
-                clause_preview = (para.clause or "").strip()[:80]
+                clause_preview = safe_clause((para.clause or "").strip(), head=80)
                 logger.info(
                     f"{_NODE_TAG} 协商被拒过滤: context 命中=\"{matched_kw}\", "
-                    f"条款={clause_preview}..."
+                    f"条款={clause_preview}"
                 )
             else:
                 _neg_filtered_paras.append(para)
@@ -915,7 +967,7 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
     payment_info_extractor_node.emit_running(
         f"正在进行付款条款有效性验证（过滤非付款条款）...",
         config,
-        progress=5
+        progress=EXTRACTOR_STAGE_PROGRESS["validate"]
     )
 
     # ========== 步骤1: 条款有效性验证（LLM校验，过滤非付款条款） ==========
@@ -973,7 +1025,7 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
             continue
         if _is_table_or_non_clause(sc_text):
             prefilter_count += 1
-            logger.info(f"预过滤跳过非自然语言条款 ID={i}: {sc_text[:80]}...")
+            logger.info(f"{_NODE_TAG} 预过滤跳过非自然语言条款 ID={i}: {safe_clause(sc_text, head=80)}")
             continue
         _kept_paragraphs.append(para)
     if prefilter_count > 0:
@@ -1065,7 +1117,7 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
                     invalid_count += 1
                     reason = result.get("reason", "未知原因")
                     logger.info(f"条款验证不通过，已过滤: ID={clause_id}, 原因={reason}")
-                    logger.debug(f"  过滤条款原文: {original_para.clause[:100]}...")
+                    logger.debug(f"  过滤条款原文: {safe_clause(original_para.clause, head=100)}")
 
             logger.success(f"条款有效性验证完成：共 {len(clauses_to_validate)} 条，验证通过 {len(validated_paragraphs)} 条，过滤 {invalid_count} 条")
 
@@ -1088,7 +1140,7 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
         payment_info_extractor_node.emit_running(
             f"正在对 {len(mixed_paragraphs_to_classify)} 条混签付款条款执行归属判定...",
             config,
-            progress=8,
+            progress=EXTRACTOR_STAGE_PROGRESS["resolve_mixed"],
         )
         mixed_route_stats = {"equipment_payment": 0, "installation_payment": 0, "both": 0}
         logger.info(f"{_NODE_TAG} 步骤1.5: 混签归属判定，共 {len(mixed_paragraphs_to_classify)} 条")
@@ -1215,7 +1267,7 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
     payment_info_extractor_node.emit_running(
         f"正在对 {len(payment_paragraphs)} 个支付条款进行RAG+LLM分析...",
         config,
-        progress=20
+        progress=EXTRACTOR_STAGE_PROGRESS["concurrent_extract"]
     )
 
     # 每个 para 是一个原子子条款，用全局枚举 index 作为唯一标识
@@ -1226,6 +1278,27 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
         ))
 
     task_results = await asyncio.gather(*tasks)
+
+    # H2 修复：基于 _process_single_payment_paragraph 上报的错误做失败率裁决
+    _errors = state.get("_extraction_errors", []) or []
+    _total = len(payment_paragraphs)
+    _failed_paras = len({err.get("paragraph_idx") for err in _errors if err.get("paragraph_idx") is not None})
+    if _total > 0:
+        _fail_rate = _failed_paras / _total
+        _threshold = get_failure_rate_threshold()
+        if _fail_rate > _threshold:
+            state["extraction_partial"] = True
+            state["extraction_failure_rate"] = round(_fail_rate, 4)
+            logger.error(
+                f"{_NODE_TAG} 抽取失败率过高: {_failed_paras}/{_total}={_fail_rate:.2%} > "
+                f"阈值 {_threshold:.2%}，已标记 extraction_partial=true"
+            )
+        else:
+            state["extraction_partial"] = False
+    else:
+        state["extraction_partial"] = False
+    # 把内部错误列表升级为公开字段（API 层取用）
+    state["extraction_errors"] = list(_errors)
 
     # 解包每个任务的结果
     processed_results = []
@@ -1300,9 +1373,9 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
     equip_ref_counter = Counter(equip_context_refs)
     install_ref_counter = Counter(install_context_refs)
     for ref_idx, mc in enumerate(equip_merged_contexts, 1):
-        logger.debug(f"    设备上下文[{ref_idx}]（被 {equip_ref_counter[ref_idx - 1]} 条条款引用）: {mc[:100]}...")
+        logger.debug(f"    设备上下文[{ref_idx}]（被 {equip_ref_counter[ref_idx - 1]} 条条款引用）: {safe_clause(mc, head=100)}")
     for ref_idx, mc in enumerate(install_merged_contexts, 1):
-        logger.debug(f"    安装上下文[{ref_idx}]（被 {install_ref_counter[ref_idx - 1]} 条条款引用）: {mc[:100]}...")
+        logger.debug(f"    安装上下文[{ref_idx}]（被 {install_ref_counter[ref_idx - 1]} 条条款引用）: {safe_clause(mc, head=100)}")
 
     items_for_summary = []
     install_items_for_summary = []
@@ -1353,7 +1426,7 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
     payment_info_extractor_node.emit_running(
         f"初步提取完成，准备对 {len(items_for_summary)+len(install_items_for_summary)} 条款进行批量复核...", 
         config, 
-        progress=60
+        progress=EXTRACTOR_STAGE_PROGRESS["summary_review"]
     )
  
     # 组织复核上下文（质保已在上方单独抽取），准备批量复核
@@ -1379,7 +1452,7 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
     payment_info_extractor_node.emit_running(
         f"正在对提取结果进行校验...", 
         config, 
-        progress=70
+        progress=EXTRACTOR_STAGE_PROGRESS["result_verify"]
     )
     # 调用校验函数
     validated_summary_result, validated_thinking_info, dedup_removed_ids = await _validate_extraction_results(
@@ -1397,6 +1470,19 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
 
     final_payment_infos: List[PaymentInfo] = []
     final_thinking_info: Optional[ThinkingInfo] = thinking_info
+
+    # H3 修复：构建 prefix-30 hash 桶，回退匹配先在同桶内查找，
+    # 避免 LLM 改写 id 时全量 N×M·L² 的相似度回退。
+    _fallback_buckets: Dict[str, List[str]] = {}
+    for _bk_key, _bk_item in summary_key_to_initial_item.items():
+        _bk_clause = str(_bk_item.get('payment_clause', '') or '').strip()
+        if not _bk_clause:
+            continue
+        _bk_id = _bk_clause[:30]
+        _fallback_buckets.setdefault(_bk_id, []).append(_bk_key)
+    _fallback_total_keys = list(summary_key_to_initial_item.keys())
+    _fallback_hits = 0
+    _fallback_misses = 0
 
     # 【核心修改】在最终循环创建 PaymentInfo 对象时
     processed_ids: set = set()  # 防止同一 id 被重复处理（如 LLM 将一个 id 拆成多个节点）
@@ -1424,8 +1510,18 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
             if reviewed_clause_text:
                 reviewed_prefix = reviewed_clause_text[:30]
                 reviewed_len = len(reviewed_clause_text)
-                for map_key, map_item in summary_key_to_initial_item.items():
+                # H3 修复：先在 hash 桶内尝试匹配；命中则跳过全量遍历
+                _bucket_keys = _fallback_buckets.get(reviewed_prefix, [])
+                _candidate_keys = _bucket_keys if _bucket_keys else _fallback_total_keys
+                if _bucket_keys:
+                    _fallback_hits += 1
+                else:
+                    _fallback_misses += 1
+                for map_key in _candidate_keys:
                     if map_key in processed_ids:
+                        continue
+                    map_item = summary_key_to_initial_item.get(map_key)
+                    if not map_item:
                         continue
                     map_clause = str(map_item.get('payment_clause', '') or '').strip()
                     if not map_clause:
@@ -1468,11 +1564,11 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
                 logger.warning(
                     f"复核结果中有无法匹配的项（ID和文本均未命中）: id={item_id}, "
                     f"category={getattr(reviewed_item, 'clause_category', '')}, "
-                    f"clause={reviewed_clause_text[:80]}"
+                    f"clause={safe_clause(reviewed_clause_text, head=80)}"
                 )
                 continue
         else:
-            logger.warning(f"复核结果中有无id字段的项: category={getattr(reviewed_item, 'clause_category', '')}, clause={str(getattr(reviewed_item, 'payment_clause', ''))[:80]}")
+            logger.warning(f"复核结果中有无id字段的项: category={getattr(reviewed_item, 'clause_category', '')}, clause={safe_clause(getattr(reviewed_item, 'payment_clause', ''), head=80)}")
             continue
             
         final_ratio_str = getattr(reviewed_item, 'final_ratio', None)
@@ -1482,13 +1578,29 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
         # 获取 sub_clause_index（用于标识原始条款）
         sub_clause_index = initial_item.get('sub_clause_index')
 
-        if final_payment_type and final_ratio_str:
+        # 当 summary LLM 返回 ratio=null 时，回退使用初始提取的 ratio
+        if not final_ratio_str or str(final_ratio_str).strip().lower() in ('none', 'null', ''):
+            initial_ratio = initial_item.get('payment_ratio')
+            if initial_ratio is not None:
+                final_ratio_str = str(initial_ratio) if not str(initial_ratio).endswith('%') else str(initial_ratio)
+                # 如果 initial_ratio 已经是 0.5 这种小数形式，转为百分比字符串
+                try:
+                    _r = float(initial_ratio)
+                    if 0 < _r <= 1:
+                        final_ratio_str = f"{_r * 100}%"
+                    else:
+                        final_ratio_str = f"{_r}%"
+                except (ValueError, TypeError):
+                    final_ratio_str = str(initial_ratio)
+
+        if final_payment_type:
             try:
+                # ratio 可为空（仅金额无比例的节点也合法，如"38100元 进场前首付"）
                 ratio_str = str(final_ratio_str).strip() if final_ratio_str else ""
-                if not ratio_str:
-                    logger.warning(f"final_ratio_str为空或无效: '{final_ratio_str}' for item_id '{item_id}'")
-                    continue
-                ratio_val = float(ratio_str.replace('%', '')) / 100.0
+                if ratio_str and ratio_str.lower() not in ('none', 'null'):
+                    ratio_val = float(ratio_str.replace('%', '')) / 100.0
+                else:
+                    ratio_val = None
 
                 # M7：集中化归一化——将中文分类映射到英文Literal值
                 clause_class_list = initial_item.get('clause_class', [])
@@ -1511,9 +1623,15 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
                             f"'{final_payment_type}' (item_id={item_id})"
                         )
                         continue
+                    elif _pt_action == "missing":
+                        # H4 修复：payment_type 字段缺失但条款本体有效；保留节点不丢弃
+                        logger.warning(
+                            f"{_NODE_TAG} 安装侧 payment_type 字段缺失，保留节点 "
+                            f"(item_id={item_id}, clause={safe_clause(initial_item.get('payment_clause'))})"
+                        )
 
                 # 硬规则兜底：辅助费目（保养费/指导费等）+ 无显式比例 → 强制清空 ratio
-                final_ratio_val: Optional[float] = round(ratio_val, 4)
+                final_ratio_val: Optional[float] = round(ratio_val, 4) if ratio_val is not None else None
                 if _should_strip_ratio(initial_item.get('payment_clause', '')):
                     logger.info(
                         f"{_NODE_TAG} 复核阶段命中辅助费目硬规则，强制清空 ratio "
@@ -1546,7 +1664,7 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
                         logger.warning(
                             f"{_NODE_TAG} 复核阶段拒绝覆盖：summary final_amount={_summary_amount_str} "
                             f"未在条款原文出现，保持 initial={_initial_amount} "
-                            f"(item_id={item_id}, clause={_clause_text_for_amount[:50]}...)"
+                            f"(item_id={item_id}, clause={safe_clause(_clause_text_for_amount, head=50)})"
                         )
                         final_amount_val = _initial_amount
                 else:
@@ -1612,9 +1730,14 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
                     orig_type = _normalized_pt
                 elif _pt_action == "dropped":
                     logger.warning(
-                        f"  跳过恢复 key={key}：安装侧 payment_type 非法 '{orig_type}'"
+                        f"{_NODE_TAG} 跳过恢复 key={key}：安装侧 payment_type 非法 '{orig_type}'"
                     )
                     continue
+                elif _pt_action == "missing":
+                    # H4 修复：恢复路径同样区分 missing 与 dropped；缺字段不丢节点
+                    logger.warning(
+                        f"{_NODE_TAG} 恢复分支安装侧 payment_type 缺失，保留节点 (key={key})"
+                    )
 
             # 跳过同 category 下已存在相同 payment_type 的条款（LLM 已有意去重）
             existing_types = {(info.clause_category, info.payment_type) for info in final_payment_infos}
@@ -1664,7 +1787,7 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
                 final_payment_infos.append(info)
                 logger.warning(
                     f"  恢复条款 key={key}: 类型='{orig_type}', 比例={orig_ratio}, "
-                    f"条款='{orig_clause[:60]}...'"
+                    f"条款={safe_clause(orig_clause, head=60)}"
                 )
             except Exception as e:
                 logger.error(f"  恢复条款 key={key} 时创建 PaymentInfo 失败: {e}")
@@ -1679,6 +1802,14 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
         logger.warning(f"{_NODE_TAG} 未能提取到思考过程信息")
 
     logger.success(f"{_NODE_TAG} 支付信息提取完成，共提取 {len(final_payment_infos)} 个支付条款")
+
+    # H3 修复：记录 hash 桶命中率，便于评估优化效果（命中率高 → 全量遍历调用次数显著下降）
+    _fb_total = _fallback_hits + _fallback_misses
+    if _fb_total > 0:
+        logger.debug(
+            f"{_NODE_TAG} 复核回填 hash 桶命中率: {_fallback_hits}/{_fb_total} "
+            f"({_fallback_hits / _fb_total:.1%})，桶 miss 时退化为全量遍历"
+        )
 
     await DebugHelper.save_snapshot(
         doc_id=state['document_id'], step_name="summary-llm_stage2",

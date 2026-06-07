@@ -63,7 +63,7 @@ class PaymentRatioExtractor:
             self.llm = ChatOpenAI(
                 model=model_identifier,
                 temperature=temperature,
-                openai_api_key=llm_config.get("api_key"),
+                openai_api_key=llm_config.get("api_key") or "EMPTY",
                 openai_api_base=llm_config.get("api_base"),
                 max_tokens=llm_max_tokens,
                 request_timeout=_LLM_REQUEST_TIMEOUT_SEC,
@@ -379,10 +379,10 @@ class PaymentRatioExtractor:
         payment_ratio_llm_config = state.get("payment_ratio_llm_config")
         llm_config = state.get("llm_config")
         
-        selected_llm_config = payment_ratio_llm_config if payment_ratio_llm_config and payment_ratio_llm_config.get("api_key") else llm_config
+        selected_llm_config = payment_ratio_llm_config if payment_ratio_llm_config and payment_ratio_llm_config.get("api_base") else llm_config
         
-        if not (selected_llm_config and selected_llm_config.get("api_key")):
-            logger.error("LLM配置或API Key缺失，无法提取支付信息。")
+        if not (selected_llm_config and selected_llm_config.get("api_base")):
+            logger.error("LLM配置或API Base缺失，无法提取支付信息。")
             return []
         
         # 2. 检查并按需（重新）初始化LLM
@@ -640,7 +640,7 @@ class PaymentSummaryRatioExtractor:
             logger.info("开始初始化PaymentSummaryRatioExtractor...")
             # 优先使用调用方注入的 override（I1），其次走默认 app_settings
             override_cfg = self.current_llm_config
-            if override_cfg and override_cfg.get("api_key"):
+            if override_cfg and override_cfg.get("api_base"):
                 # 用 override 覆盖 app_settings.llm
                 from app.config.config_models import LLMConfig
                 try:
@@ -650,15 +650,15 @@ class PaymentSummaryRatioExtractor:
                 llm_config = overlay
             else:
                 payment_ratio_llm_config = getattr(self.app_settings, 'payment_ratio_llm', None)
-                llm_config = payment_ratio_llm_config if payment_ratio_llm_config and payment_ratio_llm_config.api_key else self.app_settings.llm
+                llm_config = payment_ratio_llm_config if payment_ratio_llm_config and payment_ratio_llm_config.api_base else self.app_settings.llm
             logger.info(f"PaymentSummaryRatioExtractor 使用 LLM 配置: model={getattr(llm_config, 'model', None) or getattr(llm_config, 'model_name', None)}")
 
-            if not (llm_config and llm_config.api_key):
-                logger.warning("LLM API Key 未配置，支付比例批量复核器将不可用。")
+            if not (llm_config and llm_config.api_base):
+                logger.warning("LLM API Base 未配置，支付比例批量复核器将不可用。")
                 return
 
             payment_ratio_llm_config_verification = getattr(self.app_settings, 'llm', None)
-            llm_config_verification = payment_ratio_llm_config_verification if payment_ratio_llm_config_verification and payment_ratio_llm_config_verification.api_key else self.app_settings.llm
+            llm_config_verification = payment_ratio_llm_config_verification if payment_ratio_llm_config_verification and payment_ratio_llm_config_verification.api_base else self.app_settings.llm
             logger.info(f"PaymentSummaryRatioExtractor使用 {'专用的' if llm_config_verification == payment_ratio_llm_config_verification else '默认的'} LLM配置")
 
             model_identifier = llm_config.model or llm_config.model_name
@@ -674,7 +674,7 @@ class PaymentSummaryRatioExtractor:
 
             llm = ChatOpenAI(
                 model=model_identifier, temperature=temperature,
-                openai_api_key=llm_config.api_key, openai_api_base=llm_config.api_base,
+                openai_api_key=llm_config.api_key or "EMPTY", openai_api_base=llm_config.api_base,
                 max_tokens=llm_max_tokens,
                 request_timeout=_LLM_REQUEST_TIMEOUT_SEC,
                 max_retries=_LLM_MAX_RETRIES,
@@ -682,7 +682,7 @@ class PaymentSummaryRatioExtractor:
 
             llm_verification = ChatOpenAI(
                 model=model_identifier_verification, temperature=temperature,
-                openai_api_key=llm_config_verification.api_key, openai_api_base=llm_config_verification.api_base,
+                openai_api_key=llm_config_verification.api_key or "EMPTY", openai_api_base=llm_config_verification.api_base,
                 max_tokens=llm_max_tokens,
                 request_timeout=_LLM_REQUEST_TIMEOUT_SEC,
                 max_retries=_LLM_MAX_RETRIES,
@@ -2196,11 +2196,11 @@ class PaymentSummaryRatioExtractor:
 
     @staticmethod
     def _validation_fallback(clause: Dict[str, Any], reason: str) -> Dict[str, Any]:
-        """fail-closed 兜底：解析失败/异常一律视为无效条款（I3）。"""
+        """fail-open 兜底：解析失败/异常时保留条款，交由后续提取/复核阶段判断。"""
         return {
             "id": clause.get("id", ""),
-            "is_valid": False,
-            "reason": reason,
+            "is_valid": True,
+            "reason": f"fallback_keep: {reason}",
             "text": clause.get("clause", ""),
             "clause_class": clause.get("clause_class", ""),
             "clause_context": clause.get("clause_context", ""),
@@ -2240,7 +2240,16 @@ class PaymentSummaryRatioExtractor:
                 "clause_class": category,
             }
 
-            clause_str = json.dumps(clause_for_validation, ensure_ascii=False)
+            # 注意：此处刻意不使用 json.dumps 序列化为 JSON 对象字符串。
+            # 因为完整 JSON 对象（如 {"id":2,"clause":"...","clause_class":"..."}）会让
+            # 模型把单条输入误识别为"列表中的一项"，触发自回归续写幻觉，
+            # 接龙输出 id=3、id=4 等伪造条款（线上已观测到该错位现象）。
+            # 改为 plain key/value 多行文本，与单条校验语义一致，避免诱导列表续写。
+            clause_str = (
+                f'"id": {clause_for_validation["id"]}\n'
+                f'"clause": {clause_for_validation["clause"]}\n'
+                f'"clause_class": {clause_for_validation["clause_class"]}'
+            )
 
             input_dict = {
                 "validation_clauses": clause_str,
@@ -2260,8 +2269,12 @@ class PaymentSummaryRatioExtractor:
         """
         解析单条条款校验LLM的输出。
 
-        期望格式：
-        {"id": "ID", "is_valid": true/false, "reason": "..."}
+        模型可能输出以下几种格式：
+        1. 直接 JSON：{"id": "ID", "is_valid": true/false, "reason": "..."}
+        2. 先思考再 JSON："reason text" → false\n{"id":...}
+        3. 幻觉多条款："reason"\n{"id":"1",...}\n{"id":"2",...}
+
+        策略：提取第一个完整 JSON 对象；若失败则从前置自然语言推断 is_valid。
         """
         try:
             import re
@@ -2272,49 +2285,48 @@ class PaymentSummaryRatioExtractor:
             cleaned = re.sub(r'^```(?:json)?\s*\n?', '', cleaned, flags=re.MULTILINE)
             cleaned = re.sub(r'\n?```\s*$', '', cleaned, flags=re.MULTILINE)
 
-            # 处理转义
-            cleaned = cleaned.replace('\\\\"', '"')
-            cleaned = cleaned.replace('\\"', '"')
+            # 处理转义：仅修复双重转义（如 LLM 输出被额外包了一层字符串转义的情况）
+            # 注意：不能替换单层 \" → "，因为这是 JSON 字符串值内部的合法转义
+            cleaned = cleaned.replace('\\\\"', '\\"')
             cleaned = cleaned.replace('\\n', ' ')
             cleaned = cleaned.replace('\\t', ' ')
 
-            # 查找 JSON 对象
+            # 提取第一个完整 JSON 对象（匹配大括号配对）
             first_brace = cleaned.find('{')
             if first_brace == -1:
-                logger.warning(f"未找到JSON对象，fail-closed ID={original_clause.get('id')}")
-                return self._validation_fallback(original_clause, "no_json_object")
+                # 无 JSON，从自然语言推断
+                return self._infer_validity_from_text(cleaned, original_clause)
 
-            last_brace = cleaned.rfind('}')
-            if last_brace == -1:
-                logger.warning(f"未找到JSON结束标记，fail-closed ID={original_clause.get('id')}")
-                return self._validation_fallback(original_clause, "no_json_close")
+            # 从 first_brace 开始，找到第一个配对完整的 '}'
+            depth = 0
+            end_pos = -1
+            for pos in range(first_brace, len(cleaned)):
+                if cleaned[pos] == '{':
+                    depth += 1
+                elif cleaned[pos] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = pos
+                        break
 
-            json_str = cleaned[first_brace:last_brace + 1]
+            if end_pos == -1:
+                return self._infer_validity_from_text(cleaned, original_clause)
+
+            json_str = cleaned[first_brace:end_pos + 1]
 
             parsed_data = None
             try:
                 parsed_data = json.loads(json_str)
             except json.JSONDecodeError:
-                # 备用方案：用正则提取 is_valid 字段
-                logger.debug(f"JSON解析失败，尝试正则提取 ID={original_clause.get('id')}")
-                valid_match = re.search(r'"is_valid"\s*:\s*(true|false)', json_str, re.IGNORECASE)
-                reason_match = re.search(r'"reason"\s*:\s*"([^"]*)"', json_str)
-                if valid_match:
-                    parsed_data = {
-                        "id": original_clause.get("id", ""),
-                        "is_valid": valid_match.group(1).lower() == "true",
-                        "reason": reason_match.group(1) if reason_match else "",
-                    }
-                else:
-                    logger.warning(f"正则提取也失败，fail-closed ID={original_clause.get('id')}")
-                    return self._validation_fallback(original_clause, "regex_extract_failed")
+                # 第一个 JSON 对象解析失败，从前置文本推断
+                prefix_text = cleaned[:first_brace]
+                return self._infer_validity_from_text(prefix_text, original_clause)
 
             if isinstance(parsed_data, list) and len(parsed_data) > 0:
                 parsed_data = parsed_data[0]
 
             if not isinstance(parsed_data, dict):
-                logger.warning(f"条款校验输出格式异常，fail-closed ID={original_clause.get('id')}")
-                return self._validation_fallback(original_clause, "non_dict_payload")
+                return self._infer_validity_from_text(cleaned, original_clause)
 
             return {
                 "id": parsed_data.get("id", original_clause.get("id", "")),
@@ -2328,6 +2340,60 @@ class PaymentSummaryRatioExtractor:
         except Exception as e:
             logger.error(f"解析单条条款校验输出失败 ID={original_clause.get('id')}: {e}")
             return self._validation_fallback(original_clause, f"parse_exception: {type(e).__name__}")
+
+    def _infer_validity_from_text(self, text: str, original_clause: Dict[str, Any]) -> Dict[str, Any]:
+        """从 LLM 输出的自然语言部分推断 is_valid。
+
+        模型倾向于先输出判断理由（如 "仅描述支付方式...→ false"），
+        据此推断有效性：含否定判断关键词 → is_valid=False；否则 fail-open 保留。
+        """
+        import re
+        clause_id = original_clause.get("id", "")
+
+        # 否定判断指标：模型输出中含这些模式时视为 is_valid=False
+        negative_patterns = [
+            r'→\s*false',
+            r'is_valid["\s:]*false',
+            r'无具体金额',
+            r'无具体比例',
+            r'概述性条款',
+            r'仅描述支付方式',
+            r'仅描述支付通道',
+            r'无支付动作',
+            r'非正常情境',
+        ]
+        for pat in negative_patterns:
+            if re.search(pat, text, re.IGNORECASE):
+                logger.debug(f"从LLM前置文本推断 is_valid=false, ID={clause_id}, 匹配: {pat}")
+                return {
+                    "id": clause_id,
+                    "is_valid": False,
+                    "reason": f"inferred_false: {text[:80]}",
+                    "text": original_clause.get("clause", ""),
+                    "clause_class": original_clause.get("clause_class", ""),
+                    "clause_context": original_clause.get("clause_context", ""),
+                }
+
+        # 肯定判断指标
+        positive_patterns = [
+            r'→\s*true',
+            r'is_valid["\s:]*true',
+        ]
+        for pat in positive_patterns:
+            if re.search(pat, text, re.IGNORECASE):
+                logger.debug(f"从LLM前置文本推断 is_valid=true, ID={clause_id}")
+                return {
+                    "id": clause_id,
+                    "is_valid": True,
+                    "reason": f"inferred_true: {text[:80]}",
+                    "text": original_clause.get("clause", ""),
+                    "clause_class": original_clause.get("clause_class", ""),
+                    "clause_context": original_clause.get("clause_context", ""),
+                }
+
+        # 无法推断，fail-open 保留
+        logger.debug(f"无法从LLM输出推断有效性，保留条款 ID={clause_id}")
+        return self._validation_fallback(original_clause, "cannot_infer")
 
     # ==================================================================================
     # 混签付款条款归属判定（仅对 clause_class 含 "混签付款条款" / "mixed_payment" 的条款触发）

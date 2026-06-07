@@ -1,0 +1,58 @@
+# =============================================================================
+# Service 2 — .gitignore
+# =============================================================================
+
+# --- 凭据 / 敏感配置（安全红线：绝对禁止提交） ---
+.env
+.env_63
+.env.*
+!.env.example
+*.pem
+*.key
+*.secret
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# --- 测试 / 覆盖率 ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# --- IDE / 工具 ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.opencode/
+.comate/
+
+# --- 虚拟环境 ---
+.venv/
+venv/
+env/
+
+# --- Poetry ---
+# poetry.lock 保留提交（锁定依赖版本），仅忽略 .virtualenv
+.python-version
+
+# --- 操作系统 ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- 临时 / 调试输出 ---
+*.log
+snapshots/
+debug_output/

@@ -22,7 +22,7 @@
   <main class="container">
     <!-- 上传表单 -->
     <section class="card" id="upload-card">
-      <h2>① 上传合同</h2>
+      <h2>上传合同 <small style="font-family:var(--mono);font-size:11px;color:var(--muted);font-weight:400;letter-spacing:.1em;margin-left:6px;">/ Upload</small></h2>
       <form id="upload-form">
         <div class="field">
           <label for="file">合同文件（.md）</label>
@@ -84,7 +84,7 @@
 
     <!-- 进度 -->
     <section class="card progress-card" id="progress-card" hidden>
-      <h2>② 处理进度</h2>
+      <h2>处理进度 <small style="font-family:var(--mono);font-size:11px;color:var(--muted);font-weight:400;letter-spacing:.1em;margin-left:6px;">/ Pipeline</small></h2>
       <ol class="progress-list">
         <li data-stage="upload">上传文件</li>
         <li data-stage="step1">
@@ -102,14 +102,14 @@
 
     <!-- 错误 -->
     <section class="card error-card" id="error-card" hidden>
-      <h2>⚠️ 错误</h2>
+      <h2>异常 <small style="font-family:var(--mono);font-size:11px;color:#9b2226;font-weight:400;letter-spacing:.1em;margin-left:6px;">/ Error</small></h2>
       <div id="error-body"></div>
     </section>
 
     <!-- Step 1 -->
     <section class="card" id="step1-card" hidden>
       <div class="card-title-row">
-        <h2>Step 1 · Service 1 付款/质保期相关条款</h2>
+        <h2>Step I · 付款 / 质保期相关条款 <small style="font-family:var(--mono);font-size:11px;color:var(--muted);font-weight:400;letter-spacing:.1em;margin-left:6px;">Service 1</small></h2>
         <button type="button" id="copy-step1-payment-btn" class="copy-btn">一键复制付款条款</button>
       </div>
       <div class="meta" id="step1-meta"></div>
@@ -153,7 +153,7 @@
 
     <!-- Step 2 -->
     <section class="card" id="step2-card" hidden>
-      <h2>Step 2 · Service 2 付款节点提取</h2>
+      <h2>Step II · 付款节点提取 <small style="font-family:var(--mono);font-size:11px;color:var(--muted);font-weight:400;letter-spacing:.1em;margin-left:6px;">Service 2</small></h2>
       <div class="meta" id="step2-meta"></div>
 
       <div class="section-title-row">

@@ -31,6 +31,7 @@ from app.utils.payment_ratio_extractor import get_summary_extractor
 from app.utils.observability import setup_observability
 from app.utils.token_counter import count_tokens, warmup as token_counter_warmup
 from app.config.business_dict import get_business_dict, assert_consistency_with_prompts
+from app.config.env_config import assert_required_env
 
 
 # =============================================================================
@@ -57,6 +58,11 @@ _MAX_CLAUSE_LEN = _safe_int_env("MAX_CLAUSE_LEN", 10000)
 
 # 调试快照开关（I4）：必须由部署侧 env 显式启用，并配合 X-Debug-Snapshot header
 _DEBUG_SNAPSHOT_ENABLED = os.getenv("SERVICE2_DEBUG_SNAPSHOT", "0").strip().lower() in ("1", "true", "yes", "on")
+# S3 修复：production 环境硬关闭调试快照，无视 env 与 header（防止误配置导致原文落盘）
+_IS_PRODUCTION = os.getenv("ENVIRONMENT", "development").strip().lower() == "production"
+if _IS_PRODUCTION and _DEBUG_SNAPSHOT_ENABLED:
+    logger.warning("生产环境检测到 SERVICE2_DEBUG_SNAPSHOT=1，已强制关闭以防原文泄漏。")
+    _DEBUG_SNAPSHOT_ENABLED = False
 
 # id 字符集白名单（C4）
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
@@ -66,6 +72,13 @@ _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 async def lifespan(app: FastAPI):
     await setup_logging()
     logger.info("--- Service 2 (付款信息提取服务) 启动 ---")
+
+    # ---- H6：必填 env 启动期 fail-closed 校验，缺失立即拒启 ----
+    try:
+        assert_required_env()
+    except Exception as e:
+        logger.critical(f"必填环境变量校验失败，进程退出: {e}")
+        raise
 
     # ---- P0-3：启动期强制加载业务词典；失败立即拒启 ----
     try:
@@ -391,6 +404,25 @@ async def extract_payment_info(
 
     extraction_result = _build_extraction_result(final_state_with_paras)
 
+    # H2 修复：抽取阶段失败率超阈值时返回 503 而非 200，便于上游重试 / 告警
+    if final_state.get("extraction_partial"):
+        _err_list = final_state.get("extraction_errors", []) or []
+        logger.error(
+            f"任务 {request.id} 抽取部分失败 "
+            f"(rate={final_state.get('extraction_failure_rate')})，返回 503"
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "code": "EXTRACTION_PARTIAL_FAILURE",
+                "message": "上游 LLM/RAG 失败率过高，结果可能不完整",
+                "id": request.id,
+                "failure_rate": final_state.get("extraction_failure_rate"),
+                "errors": _err_list[:20],   # 截断防止响应过大 / 信息泄露
+                "partial_result": extraction_result,
+            },
+        )
+
     if request.operation_type == "extract":
         logger.success(f"任务 {request.id} 提取完成，结果数: {len(extraction_result)}")
         return JSONResponse(content=ExtractionResponse(
@@ -451,42 +483,26 @@ class OpenAIChatResponse(BaseModel):
 
 
 def _iter_balanced_json_blocks(text: str):
-    """O(n) 栈式扫描，依次产出顶层 [...] / {...} 区段（跳过字符串与转义）。"""
+    """O(n) 扫描，依次产出顶层 [...] / {...} JSON 区段。
+
+    H5 修复：使用 ``json.JSONDecoder.raw_decode`` 滑窗，由解码器消费完整对象/数组并返回 endpos。
+    比手写括号栈更鲁棒（自然处理转义、Unicode 等异常情况），并在异常括号下不会死循环。
+    """
+    decoder = json.JSONDecoder()
     n = len(text)
     i = 0
     while i < n:
         ch = text[i]
         if ch in "[{":
-            opener = ch
-            closer = "]" if ch == "[" else "}"
-            depth = 0
-            in_str = False
-            esc = False
-            j = i
-            while j < n:
-                c = text[j]
-                if in_str:
-                    if esc:
-                        esc = False
-                    elif c == "\\":
-                        esc = True
-                    elif c == '"':
-                        in_str = False
-                else:
-                    if c == '"':
-                        in_str = True
-                    elif c == opener:
-                        depth += 1
-                    elif c == closer:
-                        depth -= 1
-                        if depth == 0:
-                            yield text[i:j + 1]
-                            i = j
-                            break
-                j += 1
-            else:
-                # 未配对，停止
-                return
+            try:
+                _, end = decoder.raw_decode(text, i)
+                yield text[i:end]
+                i = end
+                continue
+            except json.JSONDecodeError:
+                # 当前位置无法解析为合法 JSON，推进一字符继续找下一个候选起点
+                i += 1
+                continue
         i += 1
 
 

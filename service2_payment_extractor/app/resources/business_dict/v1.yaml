@@ -111,6 +111,24 @@ clause_filter:
   negotiation_reject_keywords:
     - "不予调整"
 
+# --- 设备侧节点白名单（P2） ---
+# 13 类标准设备节点，与 prompts.py _EQUIPMENT_STANDARD_NODES 对齐
+equipment:
+  payment_type_whitelist:
+    - "销售定金"
+    - "预付款"
+    - "提货款"
+    - "货到工地"
+    - "安装后"
+    - "公司验收后"
+    - "当地政府部门验收后"
+    - "结算完成"
+    - "特殊约定付款-移交前"
+    - "电梯移交用户后"
+    - "特殊约定付款-移交后"
+    - "工程整体竣工"
+    - "质保金"
+
 # --- 安装侧节点白名单与跨类映射（H6/H7） ---
 install:
   # 12 类标准安装节点

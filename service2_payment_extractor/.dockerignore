@@ -24,6 +24,8 @@ logs/
 .env
 .env.local
 .env.*.local
+*.pem
+*.key
 
 # IDE
 .idea/
@@ -44,12 +46,24 @@ outputs/
 # 测试与文档（不参与运行时镜像）
 app/tests/
 tests/
+test_service2_standalone.py
+_verify_prompt_changes.py
 *.drawio
 *.html
 *.jpg
 *.png
+*.md
+README.*
 CODE_REVIEW_*.md
+付款信息提取完整流程图/
 .comate/
+
+# 系统缓存
+.DS_Store
+Thumbs.db
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # 保留 .env.example
 !.env.example
