@@ -12,7 +12,7 @@
 
 | 配置项 | 值 |
 |--------|-----|
-| **基础URL** | `http://106.13.172.186/s-r644699c4b7c/8000` |
+| **基础URL** | `http://10.204.2.103/s-r644699c4b7c/8000` |
 | **API端点** | `/extract_payment_info` |
 | **认证方式** | Bearer Token |
 
@@ -28,7 +28,7 @@
 
 **请求示例**:
 ```bash
-curl -X GET http://106.13.172.186/s-r644699c4b7c/8000/health \
+curl -X GET http://10.204.2.103/s-r644699c4b7c/8000/health \
   -H "Authorization: Bearer 7d9b2e17-2290d95b9773-2e862b5cee2c"
 ```
 
@@ -90,7 +90,7 @@ Content-Type: application/json
 ##### 示例 1: 仅提取模式 (extract)
 
 ```bash
-curl -X POST http://106.13.172.186/s-r644699c4b7c/8000/extract_payment_info \
+curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/extract_payment_info \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer 7d9b2e17-2290d95b9773-2e862b5cee2c" \
   -d '{
@@ -119,7 +119,7 @@ curl -X POST http://106.13.172.186/s-r644699c4b7c/8000/extract_payment_info \
 ##### 示例 2: 提取并比对模式 (analyze)
 
 ```bash
-curl -X POST http://106.13.172.186/s-r644699c4b7c/8000/extract_payment_info \
+curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/extract_payment_info \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer 7d9b2e17-2290d95b9773-2e862b5cee2c" \
   -d '{
@@ -162,7 +162,7 @@ curl -X POST http://106.13.172.186/s-r644699c4b7c/8000/extract_payment_info \
 ##### 示例 3: 包含多种条款类型
 
 ```bash
-curl -X POST http://106.13.172.186/s-r644699c4b7c/8000/extract_payment_info \
+curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/extract_payment_info \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer 7d9b2e17-2290d95b9773-2e862b5cee2c" \
   -d '{
@@ -449,7 +449,7 @@ curl -X POST http://106.13.172.186/s-r644699c4b7c/8000/extract_payment_info \
 #### 请求示例
 
 ```bash
-curl -X POST http://106.13.172.186/s-r644699c4b7c/8000/v1/chat/completions \
+curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer 7d9b2e17-2290d95b9773-2e862b5cee2c" \
   -d '{
@@ -503,7 +503,7 @@ curl -X POST http://106.13.172.186/s-r644699c4b7c/8000/v1/chat/completions \
 import requests
 
 # 百舸平台配置
-BASE_URL = "http://106.13.172.186/s-r644699c4b7c/8000"
+BASE_URL = "http://10.204.2.103/s-r644699c4b7c/8000"
 API_KEY = "7d9b2e17-2290d95b9773-2e862b5cee2c"
 
 paragraphs = [
@@ -556,7 +556,7 @@ for item in result["extraction_result"]:
 import requests
 
 # 百舸平台配置
-BASE_URL = "http://106.13.172.186/s-r644699c4b7c/8000"
+BASE_URL = "http://10.204.2.103/s-r644699c4b7c/8000"
 API_KEY = "7d9b2e17-2290d95b9773-2e862b5cee2c"
 
 # 请求头
@@ -628,7 +628,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any
 
 # 百舸平台配置
-BASE_URL = "http://106.13.172.186/s-r644699c4b7c/8000"
+BASE_URL = "http://10.204.2.103/s-r644699c4b7c/8000"
 API_KEY = "7d9b2e17-2290d95b9773-2e862b5cee2c"
 
 def process_single_contract(contract_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -730,7 +730,7 @@ from requests.exceptions import RequestException
 
 try:
     # 百舸平台配置
-    BASE_URL = "http://106.13.172.186/s-r644699c4b7c/8000"
+    BASE_URL = "http://10.204.2.103/s-r644699c4b7c/8000"
     API_KEY = "7d9b2e17-2290d95b9773-2e862b5cee2c"
 
     headers = {
