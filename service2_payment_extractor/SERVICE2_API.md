@@ -139,18 +139,18 @@ curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/extract_payment_info \
     ],
     "gt_payment_stages": [
       {
-        "stage": "定金",
+        "stage": "合同定金",
         "ratio": "20%",
         "stage_amount": "5590",
         "category": "equipment_payment"
       },
       {
-        "stage": "验收款",
+        "stage": "公司验收后",
         "ratio": 0.7,
         "category": "equipment_payment"
       },
       {
-        "stage": "质保金",
+        "stage": "质保金1年",
         "ratio": "10%",
         "stage_amount": "2500",
         "category": "equipment_payment"
@@ -280,8 +280,8 @@ curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/extract_payment_info \
   ],
   "missed_payments": [
     {
-      "payment_type": "销售定金",
-      "payment_code": null,
+      "payment_type": "合同定金",
+      "payment_code": "EARNEST",
       "payment_ratio": 7.0,
       "payment_amount": "5590",
       "source": "SIS系统",
@@ -567,9 +567,9 @@ headers = {
 
 # 准备标准答案
 ground_truth = [
-    {"stage": "定金", "ratio": "20%", "category": "equipment_payment"},
-    {"stage": "验收款", "ratio": 0.7, "category": "equipment_payment"},
-    {"stage": "质保金", "ratio": "10%", "category": "equipment_payment"}
+    {"stage": "合同定金", "ratio": "20%", "category": "equipment_payment"},
+    {"stage": "公司验收后", "ratio": 0.7, "category": "equipment_payment"},
+    {"stage": "质保金1年", "ratio": "10%", "category": "equipment_payment"}
 ]
 
 # 准备合同条款段落
@@ -708,7 +708,7 @@ gt_payment_stages = [
         "category": "equipment_payment"
     },
     {
-        "stage": "尾款",
+        "stage": "质保金1年",
         "ratio": "10%",
         "stage_amount": "50000元",  # 固定金额
         "category": "installation_payment"
