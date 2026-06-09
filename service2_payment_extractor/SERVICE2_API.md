@@ -202,16 +202,26 @@ curl -X POST http://106.13.172.186/s-r644699c4b7c/8000/extract_payment_info \
       "payment_clause": "合同签订后7日内，买方支付合同总价款的30%作为预付款。",
       "payment_context": "第五条 付款方式\n5.1 合同签订后7日内，买方支付合同总价款的30%作为预付款。\n5.2 设备到货验收合格后，支付合同总价款的60%。",
       "payment_type": "预付款",
+      "payment_code": "DEPOSIT",
       "payment_ratio": 30.0,
-      "payment_amount": null
+      "payment_amount": null,
+      "payment_days": null,
+      "latest_payment_stage": null,
+      "latest_payment_date": null,
+      "special_clause_content": null
     },
     {
       "clause_category": "equipment_payment",
       "payment_clause": "设备到货验收合格后，买方支付合同总价款的60%。",
       "payment_context": "第五条 付款方式\n5.1 合同签订后7日内，买方支付合同总价款的30%作为预付款。\n5.2 设备到货验收合格后，支付合同总价款的60%。",
-      "payment_type": "到货款",
+      "payment_type": "公司验收后",
+      "payment_code": "Z004",
       "payment_ratio": 60.0,
-      "payment_amount": null
+      "payment_amount": null,
+      "payment_days": null,
+      "latest_payment_stage": null,
+      "latest_payment_date": null,
+      "special_clause_content": null
     },
     {
       "warranty": "24个月",
@@ -232,41 +242,66 @@ curl -X POST http://106.13.172.186/s-r644699c4b7c/8000/extract_payment_info \
       "clause_category": "equipment_payment",
       "payment_clause": "合同签订后3日内，甲方支付合同价款的20%作为定金。",
       "payment_context": "第四条 付款条款\n4.1 合同签订后3日内，甲方支付合同价款的20%作为定金。\n4.2 货物安装调试完成后支付至合同总价款的90%。\n4.3 质保期满无质量问题后，支付剩余10%质保金。",
-      "payment_type": "销售定金",
+      "payment_type": "合同定金",
+      "payment_code": "EARNEST",
       "payment_ratio": 20.0,
-      "payment_amount": null
+      "payment_amount": null,
+      "payment_days": null,
+      "latest_payment_stage": null,
+      "latest_payment_date": null,
+      "special_clause_content": null
     },
     {
       "clause_category": "equipment_payment",
       "payment_clause": "货物安装调试完成后支付至合同总价款的90%。",
       "payment_context": "第四条 付款条款\n4.1 合同签订后3日内，甲方支付合同价款的20%作为定金。\n4.2 货物安装调试完成后支付至合同总价款的90%。\n4.3 质保期满无质量问题后，支付剩余10%质保金。",
-      "payment_type": "验收款",
+      "payment_type": "公司验收后",
+      "payment_code": "Z004",
       "payment_ratio": 90.0,
-      "payment_amount": null
+      "payment_amount": null,
+      "payment_days": null,
+      "latest_payment_stage": null,
+      "latest_payment_date": null,
+      "special_clause_content": null
     }
   ],
   "correct_payments": [
     {
-      "payment_type": "验收款",
+      "payment_type": "公司验收后",
+      "payment_code": "Z004",
       "payment_ratio": 90.0,
       "payment_amount": null,
-      "source": "AI提取"
+      "source": "AI提取",
+      "payment_days": null,
+      "latest_payment_stage": null,
+      "latest_payment_date": null,
+      "special_clause_content": null
     }
   ],
   "missed_payments": [
     {
       "payment_type": "销售定金",
+      "payment_code": null,
       "payment_ratio": 7.0,
       "payment_amount": "5590",
-      "source": "SIS系统"
+      "source": "SIS系统",
+      "payment_days": null,
+      "latest_payment_stage": null,
+      "latest_payment_date": null,
+      "special_clause_content": null
     }
   ],
   "false_payments": [
     {
-      "payment_type": "销售定金",
+      "payment_type": "合同定金",
+      "payment_code": "EARNEST",
       "payment_ratio": 5.0,
       "payment_amount": "5590",
-      "source": "AI提取"
+      "source": "AI提取",
+      "payment_days": null,
+      "latest_payment_stage": null,
+      "latest_payment_date": null,
+      "special_clause_content": null
     }
   ],
   "evaluation_metrics": {
@@ -301,28 +336,43 @@ curl -X POST http://106.13.172.186/s-r644699c4b7c/8000/extract_payment_info \
 
 | 字段 | 类型 | 描述 |
 |------|------|------|
-| `payment_type` | string | LLM 提取出的付款类型 |
+| `payment_type` | string | 付款类型（**标准节点名称**，经映射后输出） |
+| `payment_code` | string/null | 付款节点编码 |
 | `payment_ratio` | float | 提取出的付款比例（百分比，如 `95.0` 表示 95%） |
 | `payment_amount` | string | 提取出的付款金额 |
 | `source` | string | 数据来源，固定为 `"AI提取"` |
+| `payment_days` | int/null | 占位字段（后续迭代补充） |
+| `latest_payment_stage` | string/null | 占位字段（后续迭代补充） |
+| `latest_payment_date` | string/null | 占位字段（后续迭代补充） |
+| `special_clause_content` | string/null | 占位字段（后续迭代补充） |
 
 **MissedPaymentItem 对象字段**（`missed_payments` 数组元素）:
 
 | 字段 | 类型 | 描述 |
 |------|------|------|
-| `payment_type` | string | 基准答案中的付款类型 |
+| `payment_type` | string | 基准答案中的付款类型（尝试映射为标准节点名，未命中时保持 GT 原名） |
+| `payment_code` | string/null | 付款节点编码（GT 名称未命中映射时为 `null`） |
 | `payment_ratio` | float | 基准答案中的付款比例（百分比） |
 | `payment_amount` | string | 基准答案中的付款金额 |
 | `source` | string | 数据来源，固定为 `"SIS系统"` 或其他基准来源标识 |
+| `payment_days` | int/null | 占位字段（后续迭代补充） |
+| `latest_payment_stage` | string/null | 占位字段（后续迭代补充） |
+| `latest_payment_date` | string/null | 占位字段（后续迭代补充） |
+| `special_clause_content` | string/null | 占位字段（后续迭代补充） |
 
 **FalsePaymentItem 对象字段**（`false_payments` 数组元素）:
 
 | 字段 | 类型 | 描述 |
 |------|------|------|
-| `payment_type` | string | LLM 提取出的付款类型 |
+| `payment_type` | string | 付款类型（**标准节点名称**，经映射后输出） |
+| `payment_code` | string/null | 付款节点编码 |
 | `payment_ratio` | float | 提取出的付款比例（百分比） |
 | `payment_amount` | string | 提取出的付款金额 |
 | `source` | string | 数据来源，固定为 `"AI提取"` |
+| `payment_days` | int/null | 占位字段（后续迭代补充） |
+| `latest_payment_stage` | string/null | 占位字段（后续迭代补充） |
+| `latest_payment_date` | string/null | 占位字段（后续迭代补充） |
+| `special_clause_content` | string/null | 占位字段（后续迭代补充） |
 
 **EvaluationMetrics 对象字段**:
 
@@ -340,9 +390,14 @@ curl -X POST http://106.13.172.186/s-r644699c4b7c/8000/extract_payment_info \
 | `clause_category` | string | `"equipment_payment"` 或 `"installation_payment"` |
 | `payment_clause` | string | 付款条款原文片段 |
 | `payment_context` | string | 付款条款所在段落的完整上下文（对应输入的 `clause_context`） |
-| `payment_type` | string | 付款类型（如 "销售定金"、"到货验收款"） |
+| `payment_type` | string | 付款类型（**标准节点名称**，参见下方"标准节点映射表"） |
+| `payment_code` | string/null | 付款节点编码（与 `payment_type` 对应，如 `EARNEST`、`Z023`） |
 | `payment_ratio` | float/null | 付款比例（百分比） |
 | `payment_amount` | string/null | 付款金额 |
+| `payment_days` | int/null | **占位字段（后续迭代补充）** 付款天数（自付款触发条件起的天数） |
+| `latest_payment_stage` | string/null | **占位字段（后续迭代补充）** 最迟付款节点名称 |
+| `latest_payment_date` | string/null | **占位字段（后续迭代补充）** 最迟付款时间 |
+| `special_clause_content` | string/null | **占位字段（后续迭代补充）** 特殊条款内容 |
 
 **WarrantyItem 对象字段**:
 
@@ -747,10 +802,67 @@ F1 = 2 × (精确率 × 召回率) / (精确率 + 召回率)
 
 ---
 
+## 标准节点映射表
+
+服务在输出 `payment_type` 与 `payment_code` 字段时，按 `clause_category` 查表转换：
+
+### 设备标准节点（`clause_category = "equipment_payment"`）
+
+| payment_code | 标准节点名（payment_type） | 说明 |
+|---|---|---|
+| EARNEST | 合同定金 | 合同签订后预付的定金 |
+| DEPOSIT | 预付款 | 设备预付款 |
+| WITHDRAWAL | 提货款 | 出厂/发货前付款 |
+| Z001 | 到货前 | （保留节点） |
+| Z002 | 货到工地 | 设备运抵现场即付 |
+| Z003 | 安装后 | 设备安装完成后付款 |
+| Z004 | 公司验收后 | 厂方/公司内部验收 |
+| Z005 | 当地政府部门验收后 | 政府/特种设备/技监验收 |
+| Z020 | 结算完成后 | 审价/结算完成 |
+| Z024 | 特殊约定付款-移交前 | 移交用户前的特殊约定 |
+| Z016 | 电梯移交用户后 | 移交用户即付 |
+| Z011 | 特殊约定付款-移交后 | 移交后的特殊约定 |
+| Z017 | 工程整体竣工 | 整体竣工后付款 |
+| Z023 | 质保金1年 | 质保金/质量保证金 |
+| Z006 | 质保金2年 | （保留节点） |
+| Z025 | 特殊约定付款-质保期 | （保留节点） |
+| Z021 | 保理发票 | （保留节点） |
+| Z022 | 保理应收 | （保留节点） |
+
+### 安装标准节点（`clause_category = "installation_payment"`）
+
+| payment_code | 标准节点名（payment_type） | 说明 |
+|---|---|---|
+| Z018 | 安装定金 | 安装合同定金 |
+| DOWNPAYMENT | 进场前 | 安装队进场前的首付 |
+| Z027 | 进场开工后 | 进场后付款 |
+| Z003 | 安装后 | （保留节点） |
+| Z019 | 报验前 | 报验前付款 |
+| Z004 | 公司验收后 | 公司内部验收后 |
+| Z005 | 当地政府部门验收后 | 政府验收后 |
+| Z020 | 结算完成后 | （保留节点） |
+| Z028 | 移交前 | 移交前付款 |
+| Z024 | 特殊约定付款-移交前 | 特殊付款条款 |
+| Z016 | 电梯移交用户后 | 移交用户后 |
+| Z011 | 特殊约定付款-移交后 | 特殊付款条款 |
+| Z017 | 工程整体竣工 | 整体竣工 |
+| Z023 | 质保金1年 | 安装侧质保金 |
+| Z006 | 质保金2年 | （保留节点） |
+| Z025 | 特殊约定付款-质保期 | （保留节点） |
+
+> "保留节点" 当前内部白名单无对应输出，但作为标准节点保留在配置中，便于后续扩展。
+> 若 LLM 输出的内部节点未命中映射表，`payment_type` 回退为原名，`payment_code` 为 `null`。
+> `correct_payments` / `missed_payments` / `false_payments` 中的 `payment_type` 同样经过映射（GT 来源的名称未命中时保持 GT 原名）。
+
+---
+
 ## 版本历史
 
 | 版本 | 日期 | 变更说明 |
 |------|------|----------|
+| **v1.7.1** | 2026-06 | `analyze` 模式的 `correct_payments` / `missed_payments` / `false_payments` 现统一应用标准节点映射（`payment_type` 输出映射后名称），新增 `payment_code`、`payment_days`、`latest_payment_stage`、`latest_payment_date`、`special_clause_content` 字段（后 4 个为占位，当前返回 `null`），与 `extraction_result` 中 `PaymentItem` 输出字段保持一致。 |
+| **v1.7.0** | 2026-06 | 节点输出标准化：`PaymentItem.payment_type` 现统一返回**标准节点名称**（如内部 `"销售定金"` → 输出 `"合同定金"`，`"进场前（首付）"` → `"进场前"`），并新增 `payment_code` 字段携带节点编码（如 `EARNEST`、`Z023`）。映射表来自《节点映射.xlsx》并同步至业务词典 `equipment.payment_type_mapping` / `install.payment_type_mapping`，按 `clause_category` 路由查表，未命中时 `payment_type` 回退原名、`payment_code` 为 `null`。本次仅调整 API 输出层，内部 LangGraph 状态、去重、跨类映射、比对均保持原逻辑。 |
+| **v1.6.1** | 2026-06 | `PaymentItem` 新增 4 个占位字段：`payment_days`（付款天数）、`latest_payment_stage`（最迟付款节点）、`latest_payment_date`（最迟付款时间）、`special_clause_content`（特殊条款内容）。当前版本统一返回 `null`，提取逻辑将由后续迭代补充。响应序列化由 `exclude_none=True` 调整为 `exclude_none=False`，以便上述新字段以 `null` 形式显式出现。 |
 | **v1.6.0** | 2026-10 | 内部提取链路重构（对外 API 不变）：新增 Stage 1.5 混签归属判定 LLM，仅对判定为 `both` 的混签条款展开双轨；上下文合并改为并查集(DSU)聚类，基于相似度+前后缀重叠；去重校验由批量调用改为按组并发（`verify_single_group_single`），提升 9B 模型稳定性；`PaymentRatioExtractor` / `SummaryExtractor` 单例化复用；引入 LLM 调用信号量与整体请求超时（默认 300s，超时返回 504）；启动 lifespan 中预热 tiktoken / RAG / Milvus / BM25；Stage 3 JSON 解析新增悬挂逗号修复与对象抢救；Docker 镜像替换 torch 为 CPU-only 版本。 |
 | **v1.5.1** | 2026-07 | 预过滤关键词移至 `.env` 配置（`CLAUSE_FILTER_KEYWORDS`），无需改代码即可调整；比例提取提示词新增"仅描述支付方式/工具"排除规则；精简 API 文档，删除重复章节 |
 | **v1.5.0** | 2026-07 | 修复 `payment_context` 返回值：现在正确返回输入的 `clause_context`（此前错误地复制了 `payment_clause`）；新增硬编码预过滤，含"违约金/罚款/赔偿损失/违约责任"关键词的条款在 LLM 验证前即被排除；优化付款条款验证提示词，精简至约 50 行 |

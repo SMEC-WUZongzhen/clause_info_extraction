@@ -38,13 +38,21 @@ class _ForceValidCfg(BaseModel):
     exclude_keywords: Tuple[str, ...]
 
 
+class _PtMappingItem(BaseModel):
+    source: Optional[str] = None
+    code: str
+    name: str
+
+
 class _EquipmentCfg(BaseModel):
     payment_type_whitelist: FrozenSet[str]
+    payment_type_mapping: Tuple[_PtMappingItem, ...] = ()
 
 
 class _InstallCfg(BaseModel):
     payment_type_whitelist: FrozenSet[str]
     cross_mapping: Dict[str, str]
+    payment_type_mapping: Tuple[_PtMappingItem, ...] = ()
 
     @model_validator(mode="after")
     def _check_cross_mapping_targets(self) -> "_InstallCfg":
@@ -222,5 +230,59 @@ def assert_consistency_with_prompts(strict: Optional[bool] = None) -> None:
             f"({len(install_hits)}/{len(install_whitelist)}={install_coverage:.0%})"
         )
 
+    # --- 映射表 source ↔ 白名单一致性 ---
+    equip_mapping_sources = {
+        item.source for item in bd.equipment.payment_type_mapping if item.source
+    }
+    equip_mapping_extra = equip_mapping_sources - bd.equipment.payment_type_whitelist
+    if equip_mapping_extra:
+        msg = f"[business_dict] equipment.payment_type_mapping 含不在 whitelist 的 source: {sorted(equip_mapping_extra)}"
+        if strict:
+            raise RuntimeError(msg)
+        logger.warning(msg)
 
-__all__ = ["BusinessDict", "get_business_dict", "assert_consistency_with_prompts"]
+    install_mapping_sources = {
+        item.source for item in bd.install.payment_type_mapping if item.source
+    }
+    install_mapping_extra = install_mapping_sources - bd.install.payment_type_whitelist
+    if install_mapping_extra:
+        msg = f"[business_dict] install.payment_type_mapping 含不在 whitelist 的 source: {sorted(install_mapping_extra)}"
+        if strict:
+            raise RuntimeError(msg)
+        logger.warning(msg)
+
+
+__all__ = ["BusinessDict", "get_business_dict", "get_payment_type_mapping", "assert_consistency_with_prompts"]
+
+
+# ---------------------------------------------------------------------------
+# 节点输出映射访问器
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def get_payment_type_mapping() -> Dict[str, Dict[str, Dict[str, str]]]:
+    """返回按 clause_category 组织的输出映射表。
+
+    结构: {
+        "equipment_payment": {"销售定金": {"code": "EARNEST", "name": "合同定金"}, ...},
+        "installation_payment": {"定金": {"code": "Z018", "name": "安装定金"}, ...},
+    }
+
+    仅包含 source 非 null 的条目（即有内部白名单节点对应的映射）。
+    """
+    bd = get_business_dict()
+    result: Dict[str, Dict[str, Dict[str, str]]] = {}
+
+    equip_map: Dict[str, Dict[str, str]] = {}
+    for item in bd.equipment.payment_type_mapping:
+        if item.source is not None:
+            equip_map[item.source] = {"code": item.code, "name": item.name}
+    result["equipment_payment"] = equip_map
+
+    install_map: Dict[str, Dict[str, str]] = {}
+    for item in bd.install.payment_type_mapping:
+        if item.source is not None:
+            install_map[item.source] = {"code": item.code, "name": item.name}
+    result["installation_payment"] = install_map
+
+    return result

@@ -30,7 +30,7 @@ from app.utils.comparison_helper import ComparisonHelper, PaymentStage, Comparis
 from app.utils.payment_ratio_extractor import get_summary_extractor
 from app.utils.observability import setup_observability
 from app.utils.token_counter import count_tokens, warmup as token_counter_warmup
-from app.config.business_dict import get_business_dict, assert_consistency_with_prompts
+from app.config.business_dict import get_business_dict, get_payment_type_mapping, assert_consistency_with_prompts
 from app.config.env_config import assert_required_env
 
 
@@ -224,8 +224,14 @@ class PaymentItem(BaseModel):
     payment_clause: Optional[str] = None
     payment_context: Optional[str] = None
     payment_type: Optional[str] = None
+    payment_code: Optional[str] = None
     payment_ratio: Optional[float] = None
     payment_amount: Optional[str] = None
+    # 占位字段（后续迭代补充提取逻辑，当前统一返回 null）
+    payment_days: Optional[int] = None
+    latest_payment_stage: Optional[str] = None
+    latest_payment_date: Optional[str] = None
+    special_clause_content: Optional[str] = None
 
 
 class WarrantyItem(BaseModel):
@@ -256,6 +262,7 @@ class AnalysisResponse(BaseModel):
 def _build_extraction_result(final_state: Dict[str, Any]) -> List[Union[PaymentItem, WarrantyItem]]:
     """从 final_output 中构建提取结果列表"""
     extraction_result = []
+    mapping_table = get_payment_type_mapping()
 
     payment_infos = final_state.get("payment_infos", [])
     paragraphs = final_state.get("paragraphs", [])
@@ -268,13 +275,26 @@ def _build_extraction_result(final_state: Dict[str, Any]) -> List[Union[PaymentI
 
         ratio = info_dict.get("payment_ratio")
 
+        # 应用节点映射：内部 payment_type → 标准节点名 + payment_code
+        raw_type = info_dict.get("payment_type")
+        category = info_dict.get("clause_category") or ""
+        category_mapping = mapping_table.get(category, {})
+        entry = category_mapping.get(raw_type, {}) if raw_type else {}
+        mapped_type = entry.get("name") or raw_type
+        payment_code = entry.get("code")
+
         extraction_result.append(PaymentItem(
             clause_category=info_dict.get("clause_category"),
             payment_clause=info_dict.get("payment_clause"),
             payment_context=info_dict.get("payment_context", ""),
-            payment_type=info_dict.get("payment_type"),
+            payment_type=mapped_type,
+            payment_code=payment_code,
             payment_ratio=round(ratio * 100, 2) if ratio is not None else None,
             payment_amount=info_dict.get("payment_amount"),
+            payment_days=info_dict.get("payment_days"),
+            latest_payment_stage=info_dict.get("latest_payment_stage"),
+            latest_payment_date=info_dict.get("latest_payment_date"),
+            special_clause_content=info_dict.get("special_clause_content"),
         ))
 
     warranty_info = final_state.get("warranty_info")
@@ -289,6 +309,34 @@ def _build_extraction_result(final_state: Dict[str, Any]) -> List[Union[PaymentI
         ))
 
     return extraction_result
+
+
+def _map_comparison_payments(payments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """对比对结果列表（correct/missed/false_payments）应用标准节点映射并统一输出字段。
+
+    - 应用 payment_type → 标准节点名映射
+    - 添加 payment_code（未命中为 null）
+    - 添加 4 个占位字段（payment_days / latest_payment_stage / latest_payment_date / special_clause_content）
+    """
+    mapping_table = get_payment_type_mapping()
+    # 合并设备/安装两表（重叠 key 映射一致，安全合并）
+    merged: Dict[str, Dict[str, str]] = {}
+    merged.update(mapping_table.get("equipment_payment", {}))
+    merged.update(mapping_table.get("installation_payment", {}))
+
+    result: List[Dict[str, Any]] = []
+    for item in payments or []:
+        item = dict(item)  # shallow copy 避免修改 final_output
+        raw_type = item.get("payment_type")
+        entry = merged.get(raw_type, {}) if raw_type else {}
+        item["payment_type"] = entry.get("name") or raw_type
+        item["payment_code"] = entry.get("code")
+        item["payment_days"] = None
+        item["latest_payment_stage"] = None
+        item["latest_payment_date"] = None
+        item["special_clause_content"] = None
+        result.append(item)
+    return result
 
 
 # =============================================================================
@@ -428,19 +476,19 @@ async def extract_payment_info(
         return JSONResponse(content=ExtractionResponse(
             id=request.id,
             extraction_result=extraction_result
-        ).model_dump(exclude_none=True))
+        ).model_dump())
 
     # analyze 模式
     logger.success(f"任务 {request.id} 分析完成。")
     response = AnalysisResponse(
         id=request.id,
         extraction_result=extraction_result,
-        correct_payments=final_output.get("correct_payments", []),
-        missed_payments=final_output.get("missed_payments", []),
-        false_payments=final_output.get("false_payments", []),
+        correct_payments=_map_comparison_payments(final_output.get("correct_payments", [])),
+        missed_payments=_map_comparison_payments(final_output.get("missed_payments", [])),
+        false_payments=_map_comparison_payments(final_output.get("false_payments", [])),
         evaluation_metrics=final_output.get("evaluation_metrics", {}),
     )
-    return JSONResponse(content=response.model_dump(exclude_none=True))
+    return JSONResponse(content=response.model_dump())
 
 
 # =============================================================================
@@ -718,6 +766,7 @@ async def chat_completions(request: OpenAIChatRequest):
 
         # 构建结果
         extraction_result = []
+        mapping_table = get_payment_type_mapping()
         payment_infos = final_state.get("payment_infos", []) or final_output.get("payment_infos", [])
 
         for info in payment_infos:
@@ -730,13 +779,26 @@ async def chat_completions(request: OpenAIChatRequest):
             ratio = info_dict.get("payment_ratio")
             ratio_pct = round(ratio * 100, 2) if ratio is not None else None
 
+            # 应用节点映射
+            raw_type = info_dict.get("payment_type")
+            category = info_dict.get("clause_category") or ""
+            category_mapping = mapping_table.get(category, {})
+            entry = category_mapping.get(raw_type, {}) if raw_type else {}
+            mapped_type = entry.get("name") or raw_type
+            payment_code = entry.get("code")
+
             extraction_result.append({
                 "clause_category": info_dict.get("clause_category"),
                 "payment_clause": info_dict.get("payment_clause"),
                 "payment_context": info_dict.get("payment_context"),
-                "payment_type": info_dict.get("payment_type"),
+                "payment_type": mapped_type,
+                "payment_code": payment_code,
                 "payment_ratio": ratio_pct,
                 "payment_amount": info_dict.get("payment_amount"),
+                "payment_days": info_dict.get("payment_days"),
+                "latest_payment_stage": info_dict.get("latest_payment_stage"),
+                "latest_payment_date": info_dict.get("latest_payment_date"),
+                "special_clause_content": info_dict.get("special_clause_content"),
             })
 
         warranty_info = final_state.get("warranty_info") or final_output.get("warranty_info")
