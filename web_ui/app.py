@@ -3,6 +3,8 @@
 - GET  /                 首页 (index.html)
 - POST /api/upload       上传文件 + 合同类型 → 返回 session_id
 - GET  /api/process      SSE 流式推送 step1/step2/error/done
+- POST /api/rerun-step2  重新执行 Service 2
+- POST /api/export-excel 导出 Step 2 结果到 Excel
 """
 from __future__ import annotations
 
@@ -11,12 +13,17 @@ import queue
 import threading
 import time
 import uuid
-from typing import Dict, Any
+import io
+from typing import Dict, Any, List
 
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, send_file
 from werkzeug.utils import secure_filename
 
 import config, pipeline
+import history_store
+
+# 启动时初始化历史数据库
+history_store.init_db()
 
 
 app = Flask(
@@ -94,15 +101,14 @@ def upload():
 
     if not file or not file.filename:
         return jsonify({"error": "未上传文件"}), 400
-    # 扩展名校验须基于原始文件名：secure_filename 会剥离非 ASCII 字符
-    # 并 strip("._") 首尾，导致中文文件名（如 "苏北区域..._.md"）被误判为非 .md
     original_filename = file.filename
     if not original_filename.lower().endswith(".md"):
         return jsonify({"error": "仅支持 .md 文件"}), 400
     filename = secure_filename(original_filename)
-    # 若 secure_filename 把扩展名也剥掉了（纯中文名常见），回退到原始名以保留 .md 后缀
+    # secure_filename 可能剥离纯中文名的 .md 后缀，手动追加而非回退到未净化的原始名
     if not filename.lower().endswith(".md"):
-        filename = original_filename
+        stem = filename if filename else "uploaded"
+        filename = f"{stem}.md"
     if contract_type not in ALLOWED_CONTRACT_TYPES:
         return jsonify({
             "error": f"contract_type 非法（允许: {sorted(ALLOWED_CONTRACT_TYPES)}）"
@@ -146,6 +152,7 @@ def upload():
             "md_bytes": md_bytes,
             "contract_type": contract_type,
             "filename": filename,
+            "original_filename": original_filename,
             "lines_per_chunk": lines_per_chunk,
             "max_chars": max_chars,
             "skip_service2": skip_service2,
@@ -180,6 +187,7 @@ def process():
     md_bytes = session["md_bytes"]
     contract_type = session["contract_type"]
     filename = session["filename"]
+    original_filename = session.get("original_filename", filename)
     lines_per_chunk = session.get("lines_per_chunk") or config.LINES_PER_CHUNK
     max_chars = session.get("max_chars") or config.MAX_CONTEXT_CHARS
     skip_service2 = bool(session.get("skip_service2"))
@@ -187,6 +195,14 @@ def process():
     task_id = (session.get("task_id") or "").strip() or f"webui-{int(time.time())}"
 
     def generate():
+        cancelled = threading.Event()
+        try:
+            yield from _generate_inner(cancelled)
+        except GeneratorExit:
+            cancelled.set()
+            return
+
+    def _generate_inner(cancelled: threading.Event):
         yield _sse("status", {
             "stage": "step1_running",
             "message": f"Service 1 处理中... (lines={lines_per_chunk}, max_chars={max_chars})",
@@ -197,6 +213,8 @@ def process():
         result_holder: Dict[str, Any] = {}
 
         def _on_progress(done: int, total: int):
+            if cancelled.is_set():
+                return
             progress_q.put(("progress", done, total))
 
         def _worker():
@@ -216,8 +234,14 @@ def process():
         worker.start()
 
         # 实时推送进度事件，直到 worker 完成（通过 SENTINEL 通知）
+        # 使用超时轮询以便在客户端断开时及时退出
         while True:
-            msg = progress_q.get()
+            try:
+                msg = progress_q.get(timeout=1.0)
+            except queue.Empty:
+                if cancelled.is_set():
+                    break
+                continue
             if msg is SENTINEL:
                 break
             _, done, total = msg
@@ -228,7 +252,7 @@ def process():
                 "percent": percent,
             })
 
-        worker.join()
+        worker.join(timeout=5.0)
 
         err = result_holder.get("error")
         if isinstance(err, pipeline.PipelineError):
@@ -260,7 +284,7 @@ def process():
             "all_clauses": all_clauses,
             "all_clauses_count": len(all_clauses),
             "contract_type": contract_type,
-            "filename": filename,
+            "filename": original_filename,
         })
 
         if skip_service2:
@@ -297,6 +321,277 @@ def process():
         "X-Accel-Buffering": "no",  # 禁用 Nginx 缓冲
     }
     return Response(generate(), mimetype="text/event-stream", headers=headers)
+
+
+@app.post("/api/rerun-step2")
+def rerun_step2():
+    """复用前端已缓存的 Step 1 paragraphs，仅重新执行 Service 2。
+
+    Body (JSON):
+        {
+          "paragraphs": [...],   # 已应用 contract_type 后的 paragraphs（来自前端缓存）
+          "task_id": "xxx"       # 可选；留空自动生成 webui-rerun-{时间戳}
+        }
+    """
+    data = request.get_json(silent=True) or {}
+    paragraphs = data.get("paragraphs")
+    if not isinstance(paragraphs, list):
+        return jsonify({"error": "paragraphs 必须为数组"}), 400
+    if not paragraphs:
+        return jsonify({"error": "paragraphs 为空，无法重跑 Service 2"}), 400
+
+    task_id_raw = (data.get("task_id") or "").strip()
+    if len(task_id_raw) > 128:
+        return jsonify({"error": "task_id 长度不能超过 128"}), 400
+    task_id = task_id_raw or f"webui-rerun-{int(time.time())}"
+
+    try:
+        result = pipeline.run_step2(paragraphs, task_id)
+    except pipeline.PipelineError as e:
+        return jsonify({"error": e.message, "stage": e.stage, "detail": e.detail}), 502
+    except Exception as e:
+        return jsonify({"error": f"未预期异常: {e}", "stage": "step2"}), 500
+
+    return jsonify({"task_id": task_id, "result": result})
+
+
+# ===== 字段定义（供 Excel 导出） =====
+PAYMENT_FIELDS = [
+    ("_source_file", "来源文件"),
+    ("_source_time", "来源时间"),
+    ("_source_type", "合同类型"),
+    ("clause_category", "类别"),
+    ("payment_type", "阶段类型"),
+    ("payment_code", "节点编码"),
+    ("payment_ratio", "比例"),
+    ("payment_amount", "金额"),
+    ("payment_days", "付款天数"),
+    ("latest_payment_stage", "最迟付款节点"),
+    ("latest_payment_date", "最迟付款时间(天)"),
+    ("payment_clause", "条款原文"),
+    ("payment_context", "上下文"),
+]
+WARRANTY_FIELDS = [
+    ("_source_file", "来源文件"),
+    ("_source_time", "来源时间"),
+    ("_source_type", "合同类型"),
+    ("warranty", "质保期"),
+    ("warranty_clause", "条款原文"),
+]
+
+
+@app.post("/api/export-excel")
+def export_excel():
+    """导出 Step 2 结果到 Excel 文件。
+
+    Body (JSON):
+        {
+          "payment_items": [...],
+          "warranty_items": [...],
+          "payment_fields": ["payment_type", "payment_ratio", ...],
+          "warranty_fields": ["warranty", "warranty_clause"],
+        }
+    """
+    import openpyxl
+
+    data = request.get_json(silent=True) or {}
+    payment_items = data.get("payment_items") or []
+    warranty_items = data.get("warranty_items") or []
+    selected_payment_fields = data.get("payment_fields") or []
+    selected_warranty_fields = data.get("warranty_fields") or []
+
+    if not payment_items and not warranty_items:
+        return jsonify({"error": "无数据可导出"}), 400
+
+    # 过滤为合法字段
+    valid_payment_keys = {k for k, _ in PAYMENT_FIELDS}
+    valid_warranty_keys = {k for k, _ in WARRANTY_FIELDS}
+    pay_fields = [(k, v) for k, v in PAYMENT_FIELDS if k in selected_payment_fields]
+    war_fields = [(k, v) for k, v in WARRANTY_FIELDS if k in selected_warranty_fields]
+
+    wb = openpyxl.Workbook()
+
+    # 付款条款 Sheet
+    if payment_items and pay_fields:
+        ws = wb.active
+        ws.title = "付款条款"
+        ws.append([label for _, label in pay_fields])
+        for item in payment_items:
+            row = []
+            for key, _ in pay_fields:
+                val = item.get(key, "")
+                row.append(str(val) if val is not None else "")
+            ws.append(row)
+        # 自适应列宽
+        for col_idx, (key, _) in enumerate(pay_fields, 1):
+            max_len = max(
+                len(str(ws.cell(row=r, column=col_idx).value or ""))
+                for r in range(1, ws.max_row + 1)
+            )
+            ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(max_len + 4, 60)
+
+    # 质保期 Sheet
+    if warranty_items and war_fields:
+        ws2 = wb.create_sheet("质保期") if payment_items and pay_fields else wb.active
+        if not (payment_items and pay_fields):
+            ws2.title = "质保期"
+        ws2.append([label for _, label in war_fields])
+        for item in warranty_items:
+            row = []
+            for key, _ in war_fields:
+                val = item.get(key, "")
+                row.append(str(val) if val is not None else "")
+            ws2.append(row)
+        for col_idx, (key, _) in enumerate(war_fields, 1):
+            max_len = max(
+                len(str(ws2.cell(row=r, column=col_idx).value or ""))
+                for r in range(1, ws2.max_row + 1)
+            )
+            ws2.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(max_len + 4, 60)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    filename = f"payment_export_{timestamp}.xlsx"
+
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=filename,
+    )
+
+
+# ============================================================
+#  历史记录 API
+# ============================================================
+
+@app.get("/api/history")
+def api_history_list():
+    """列表（仅摘要，不含大 JSON 字段）。"""
+    records = history_store.list_records()
+    return jsonify(records)
+
+
+@app.get("/api/history/<record_id>")
+def api_history_get(record_id: str):
+    """获取单条完整记录。"""
+    record = history_store.get_record(record_id)
+    if record is None:
+        return jsonify({"error": "记录不存在"}), 404
+    return jsonify(record)
+
+
+@app.post("/api/history")
+def api_history_create():
+    """创建一条历史记录（SSE done 后前端调用）。"""
+    data = request.get_json(silent=True) or {}
+    if not data.get("id"):
+        return jsonify({"error": "缺少 id 字段"}), 400
+    history_store.create_record(data)
+    return jsonify({"ok": True, "id": data["id"]})
+
+
+@app.delete("/api/history/<record_id>")
+def api_history_delete(record_id: str):
+    """删除单条记录。"""
+    deleted = history_store.delete_record(record_id)
+    return jsonify({"ok": True, "deleted": deleted})
+
+
+@app.delete("/api/history")
+def api_history_clear():
+    """清空全部记录。"""
+    count = history_store.delete_all()
+    return jsonify({"ok": True, "deleted_count": count})
+
+
+@app.post("/api/history/export")
+def api_history_export():
+    """批量导出勾选的历史记录到 Excel。"""
+    import openpyxl
+
+    body = request.get_json(silent=True) or {}
+    ids = body.get("ids") or []
+    if not ids:
+        return jsonify({"error": "请选择要导出的记录"}), 400
+
+    records = history_store.get_records_by_ids(ids)
+    if not records:
+        return jsonify({"error": "未找到匹配的记录"}), 404
+
+    # 收集数据，为每条添加来源标识
+    all_payment_items = []
+    all_warranty_items = []
+    for rec in records:
+        src_file = rec.get("filename", "")
+        src_time = rec.get("createdAt", "")
+        src_type = rec.get("contractTypeLabel", "")
+        for it in rec.get("paymentItems", []):
+            all_payment_items.append({
+                **it,
+                "_source_file": src_file,
+                "_source_time": src_time,
+                "_source_type": src_type,
+            })
+        for it in rec.get("warrantyItems", []):
+            all_warranty_items.append({
+                **it,
+                "_source_file": src_file,
+                "_source_time": src_time,
+                "_source_type": src_type,
+            })
+
+    if not all_payment_items and not all_warranty_items:
+        return jsonify({"error": "所选记录中无 Step 2 数据"}), 400
+
+    # 默认导出全部字段
+    pay_fields = list(PAYMENT_FIELDS)
+    war_fields = list(WARRANTY_FIELDS)
+
+    wb = openpyxl.Workbook()
+
+    if all_payment_items and pay_fields:
+        ws = wb.active
+        ws.title = "付款条款"
+        ws.append([label for _, label in pay_fields])
+        for item in all_payment_items:
+            row = [str(item.get(k, "") or "") for k, _ in pay_fields]
+            ws.append(row)
+        for col_idx, (key, _) in enumerate(pay_fields, 1):
+            max_len = max(
+                len(str(ws.cell(row=r, column=col_idx).value or ""))
+                for r in range(1, ws.max_row + 1)
+            )
+            ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(max_len + 4, 60)
+
+    if all_warranty_items and war_fields:
+        ws2 = wb.create_sheet("质保期") if all_payment_items and pay_fields else wb.active
+        if not (all_payment_items and pay_fields):
+            ws2.title = "质保期"
+        ws2.append([label for _, label in war_fields])
+        for item in all_warranty_items:
+            row = [str(item.get(k, "") or "") for k, _ in war_fields]
+            ws2.append(row)
+        for col_idx, (key, _) in enumerate(war_fields, 1):
+            max_len = max(
+                len(str(ws2.cell(row=r, column=col_idx).value or ""))
+                for r in range(1, ws2.max_row + 1)
+            )
+            ws2.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(max_len + 4, 60)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=f"history_export_{timestamp}.xlsx",
+    )
 
 
 @app.errorhandler(413)

@@ -56,12 +56,12 @@
             <div class="param-item">
               <label for="lines_per_chunk">每份行数阈值 <small>(--lines)</small></label>
               <input type="number" id="lines_per_chunk" name="lines_per_chunk"
-                     min="50" max="5000" step="50" placeholder="默认 200" />
+                     min="50" max="5000" step="50" placeholder="默认 300" />
             </div>
             <div class="param-item">
               <label for="max_chars">上下文最大字符数 <small>(--max-chars)</small></label>
               <input type="number" id="max_chars" name="max_chars"
-                     min="50" max="5000" step="50" placeholder="默认 400" />
+                     min="50" max="5000" step="50" placeholder="默认 700" />
             </div>
             <div class="param-item">
               <label for="task_id">任务 ID <small>(id)</small></label>
@@ -80,6 +80,39 @@
 
         <button type="submit" id="submit-btn">开始处理</button>
       </form>
+    </section>
+
+    <!-- 历史记录 -->
+    <section class="card" id="history-card">
+      <details id="history-details">
+        <summary>
+          <span class="toggle-text">历史记录</span>
+          <span class="all-count" id="history-count"></span>
+        </summary>
+        <div class="history-toolbar">
+          <button type="button" id="batch-export-history-btn" class="copy-btn" disabled>批量导出 Excel</button>
+          <button type="button" id="clear-history-btn" class="copy-btn">清空全部</button>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table" id="history-table">
+            <thead>
+              <tr>
+                <th style="width:36px;text-align:center;"><input type="checkbox" id="hist-select-all" title="全选/取消全选" /></th>
+                <th>#</th>
+                <th>时间</th>
+                <th>文件名</th>
+                <th>合同类型</th>
+                <th>节点</th>
+                <th>比例</th>
+                <th>金额</th>
+                <th>处理时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </details>
     </section>
 
     <!-- 进度 -->
@@ -153,7 +186,11 @@
 
     <!-- Step 2 -->
     <section class="card" id="step2-card" hidden>
-      <h2>Step II · 付款节点提取 <small style="font-family:var(--mono);font-size:11px;color:var(--muted);font-weight:400;letter-spacing:.1em;margin-left:6px;">Service 2</small></h2>
+      <div class="card-title-row">
+        <h2>Step II · 付款节点提取 <small style="font-family:var(--mono);font-size:11px;color:var(--muted);font-weight:400;letter-spacing:.1em;margin-left:6px;">Service 2</small></h2>
+        <button type="button" id="rerun-step2-btn" class="copy-btn" disabled title="使用已缓存的 Step 1 结果重新调用 Service 2（刷新页面后不可用）">重新执行 Step 2</button>
+        <button type="button" id="export-excel-btn" class="copy-btn" disabled title="导出 Step 2 结果到 Excel 文件">导出 Excel</button>
+      </div>
       <div class="meta" id="step2-meta"></div>
 
       <div class="section-title-row">
@@ -167,14 +204,22 @@
               <th>#</th>
               <th>类别</th>
               <th>阶段类型</th>
+              <th>节点编码</th>
               <th>比例</th>
               <th>金额</th>
+              <th>付款天数</th>
+              <th>最迟付款节点</th>
+              <th>最迟付款时间(天)</th>
               <th>条款原文</th>
               <th>上下文</th>
             </tr>
           </thead>
           <tbody></tbody>
         </table>
+      </div>
+      <div id="special-clause-wrap" style="display:none;margin-top:12px;">
+        <h4 style="margin:0 0 6px;font-size:13px;color:#6b7280;">特殊条款内容（全部付款条款汇总）</h4>
+        <pre id="special-clause-content" style="white-space:pre-wrap;word-break:break-all;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:10px;font-size:12px;max-height:200px;overflow-y:auto;"></pre>
       </div>
 
       <h3 class="section-title">质保期</h3>
@@ -192,6 +237,38 @@
       </div>
     </section>
   </main>
+
+  <!-- Excel 导出字段选择模态框 -->
+  <div class="modal-overlay" id="export-modal" hidden>
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>选择导出字段</h3>
+        <button type="button" class="modal-close" id="export-modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="field-group">
+          <h4>付款条款字段</h4>
+          <div class="field-checkboxes" id="payment-field-checkboxes"></div>
+          <div class="field-actions">
+            <button type="button" class="select-all-btn" data-target="payment">全选</button>
+            <button type="button" class="select-none-btn" data-target="payment">全不选</button>
+          </div>
+        </div>
+        <div class="field-group">
+          <h4>质保期字段</h4>
+          <div class="field-checkboxes" id="warranty-field-checkboxes"></div>
+          <div class="field-actions">
+            <button type="button" class="select-all-btn" data-target="warranty">全选</button>
+            <button type="button" class="select-none-btn" data-target="warranty">全不选</button>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="copy-btn" id="export-modal-cancel">取消</button>
+        <button type="button" id="export-modal-confirm" class="submit-btn">确认导出</button>
+      </div>
+    </div>
+  </div>
 
   <script src="/static/app.js"></script>
 </body>

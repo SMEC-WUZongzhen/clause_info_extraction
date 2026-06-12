@@ -24,4 +24,5 @@ EXTRACTOR_STAGE_PROGRESS = {
     "concurrent_extract": 20,   # RAG + LLM 并发抽取
     "summary_review":     60,   # 批量复核
     "result_verify":      70,   # 校验阶段
+    "payment_timing_extract": 85,   # Stage 7：付款时效 LLM 提取 + 特殊条款汇总
 }

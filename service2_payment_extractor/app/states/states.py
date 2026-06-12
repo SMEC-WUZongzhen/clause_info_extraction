@@ -50,6 +50,11 @@ class PaymentInfo(BaseModel):
     image_url: Optional[str] = None
     first_page_image_url: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    # === Stage 7（付款时效 LLM 提取 + 特殊条款汇总）新增字段 ===
+    payment_days: Optional[int] = None
+    latest_payment_stage: Optional[str] = None
+    latest_payment_date: Optional[int] = None
+    special_clause_content: Optional[str] = None
 
 
 class WarrantyInfo(BaseModel):

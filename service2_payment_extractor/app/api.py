@@ -6,7 +6,7 @@ import json
 import os
 import re
 import uuid
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, Tuple
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException
@@ -230,7 +230,7 @@ class PaymentItem(BaseModel):
     # 占位字段（后续迭代补充提取逻辑，当前统一返回 null）
     payment_days: Optional[int] = None
     latest_payment_stage: Optional[str] = None
-    latest_payment_date: Optional[str] = None
+    latest_payment_date: Optional[int] = None
     special_clause_content: Optional[str] = None
 
 
@@ -311,12 +311,19 @@ def _build_extraction_result(final_state: Dict[str, Any]) -> List[Union[PaymentI
     return extraction_result
 
 
-def _map_comparison_payments(payments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _map_comparison_payments(
+    payments: List[Dict[str, Any]],
+    timing_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
+    special_clause_content: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """对比对结果列表（correct/missed/false_payments）应用标准节点映射并统一输出字段。
 
     - 应用 payment_type → 标准节点名映射
     - 添加 payment_code（未命中为 null）
-    - 添加 4 个占位字段（payment_days / latest_payment_stage / latest_payment_date / special_clause_content）
+    - 4 个新增字段策略：
+        * special_clause_content：文档级聚合字段，对所有列表统一回填（无差异）
+        * payment_days / latest_payment_stage / latest_payment_date：仅 correct_payments
+          通过 timing_lookup（按 payment_clause 索引）回填；missed/false 保持 null
     """
     mapping_table = get_payment_type_mapping()
     # 合并设备/安装两表（重叠 key 映射一致，安全合并）
@@ -331,12 +338,41 @@ def _map_comparison_payments(payments: List[Dict[str, Any]]) -> List[Dict[str, A
         entry = merged.get(raw_type, {}) if raw_type else {}
         item["payment_type"] = entry.get("name") or raw_type
         item["payment_code"] = entry.get("code")
-        item["payment_days"] = None
-        item["latest_payment_stage"] = None
-        item["latest_payment_date"] = None
-        item["special_clause_content"] = None
+
+        timing: Dict[str, Any] = {}
+        if timing_lookup:
+            clause_key = (item.get("payment_clause") or "").strip()
+            if clause_key:
+                timing = timing_lookup.get(clause_key, {}) or {}
+        item["payment_days"] = timing.get("payment_days")
+        item["latest_payment_stage"] = timing.get("latest_payment_stage")
+        item["latest_payment_date"] = timing.get("latest_payment_date")
+        item["special_clause_content"] = special_clause_content
         result.append(item)
     return result
+
+
+def _build_timing_lookup(
+    final_state: Dict[str, Any],
+) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
+    """从 final_state 的 payment_infos 中构建 (payment_clause → timing 字段) 索引和文档级 special_clause_content。"""
+    lookup: Dict[str, Dict[str, Any]] = {}
+    special_clause_content: Optional[str] = None
+    for info in final_state.get("payment_infos", []) or []:
+        info_dict = info.model_dump() if hasattr(info, "model_dump") else (info or {})
+        clause_key = (info_dict.get("payment_clause") or "").strip()
+        if clause_key and clause_key not in lookup:
+            lookup[clause_key] = {
+                "payment_days": info_dict.get("payment_days"),
+                "latest_payment_stage": info_dict.get("latest_payment_stage"),
+                "latest_payment_date": info_dict.get("latest_payment_date"),
+            }
+        # special_clause_content 是文档级聚合，在 PaymentInfo 上重复存放；取首个非空即可
+        if special_clause_content is None:
+            scc = info_dict.get("special_clause_content")
+            if scc:
+                special_clause_content = scc
+    return lookup, special_clause_content
 
 
 # =============================================================================
@@ -480,12 +516,25 @@ async def extract_payment_info(
 
     # analyze 模式
     logger.success(f"任务 {request.id} 分析完成。")
+    timing_lookup, scc = _build_timing_lookup(final_state_with_paras)
     response = AnalysisResponse(
         id=request.id,
         extraction_result=extraction_result,
-        correct_payments=_map_comparison_payments(final_output.get("correct_payments", [])),
-        missed_payments=_map_comparison_payments(final_output.get("missed_payments", [])),
-        false_payments=_map_comparison_payments(final_output.get("false_payments", [])),
+        correct_payments=_map_comparison_payments(
+            final_output.get("correct_payments", []),
+            timing_lookup=timing_lookup,
+            special_clause_content=scc,
+        ),
+        missed_payments=_map_comparison_payments(
+            final_output.get("missed_payments", []),
+            timing_lookup=None,
+            special_clause_content=scc,
+        ),
+        false_payments=_map_comparison_payments(
+            final_output.get("false_payments", []),
+            timing_lookup=None,
+            special_clause_content=scc,
+        ),
         evaluation_metrics=final_output.get("evaluation_metrics", {}),
     )
     return JSONResponse(content=response.model_dump())

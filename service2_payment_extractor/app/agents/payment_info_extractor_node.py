@@ -67,6 +67,29 @@ def _should_strip_ratio(payment_clause: Optional[str]) -> bool:
 # 关键词与阈值已迁移至业务词典 force_valid 配置；此处仅保留判定函数。
 
 
+def _should_force_valid_by_text_features(clause: Optional[str]) -> bool:
+    """当 LLM 明确判 false 或无法推断时，用原文特征做反向兜底。
+
+    条件（全部满足）：
+    1. 原文 ≥ 30 字符（避开碎片）
+    2. 包含 % 或 ％
+    3. 包含支付动作关键词（支付/付款/付清/结算/定金/预付/提货/货到/验收/移交/进度款/尾款/余款/请款/汇入/汇至/到货款）
+
+    满足条件 → 视为有效付款条款，不被 LLM 错误过滤。
+    """
+    if not clause:
+        return False
+    text = clause.strip()
+    if len(text) < 30:
+        return False
+    if "%" not in text and "％" not in text:
+        return False
+    return bool(re.search(
+        r"支付|付款|付清|结算|定金|预付|提货|货到|验收|移交|进度款|尾款|余款|请款|汇入|汇至|到货款",
+        text,
+    ))
+
+
 def _should_force_valid(clause: Optional[str], clause_class: Optional[List[str]]) -> bool:
     """判断条款是否应被白名单强制保留为有效。
 
@@ -146,11 +169,10 @@ def _amount_appears_in_text(amount_str: Optional[str], text: Optional[str]) -> b
 
 
 def _postprocess_final_payment_infos(infos: List[PaymentInfo]) -> List[PaymentInfo]:
-    """对复核后的最终 PaymentInfo 列表做两件事：
+    """对复核后的最终 PaymentInfo 列表做三件事：
       1) 算术校核：原文不含 % 且 payment_context 中存在唯一数字总价、且 amount==total → 强制 ratio=1.0；
       2) 零金额清理：amount 解析后==0（含 "0"/"0.00"/"0元"/空字符串）→ 丢弃该节点。
-         适用于含比例但金额标 0 的无效条款（如延保/附件中的 5% 占位条款），
-         也覆盖原 "ratio==0 且 amount==0" 的零节点场景。
+      3) 空节点清理：payment_ratio 为 None 或 0 且 payment_amount 为 None 或 0 → 丢弃（只有节点类型，无实质信息）。
     """
     if not infos:
         return infos
@@ -185,6 +207,21 @@ def _postprocess_final_payment_infos(infos: List[PaymentInfo]) -> List[PaymentIn
                     f"原条款={safe_clause(clause, head=60)}"
                 )
                 continue
+
+        # 3) 空节点清理：ratio 无值/为0 且 amount 无值/为0 → 只有类型壳，丢弃
+        ratio_zero = info.payment_ratio is None or abs(float(info.payment_ratio)) < 0.001
+        try:
+            amt_val = float(str(info.payment_amount)) if info.payment_amount is not None else None
+        except (ValueError, TypeError):
+            amt_val = None
+        amount_zero = amt_val is None or abs(amt_val) < 0.01
+        if ratio_zero and amount_zero:
+            logger.info(
+                f"{_NODE_TAG} 删除空壳节点（ratio/amount均无值）: "
+                f"类型={info.payment_type}, ratio={info.payment_ratio}, amount={info.payment_amount}, "
+                f"原条款={safe_clause(clause, head=60)}"
+            )
+            continue
 
         cleaned.append(info)
     return cleaned
@@ -1079,7 +1116,26 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
                     continue
 
                 # I3: fail-closed —— 仅当 LLM 显式返回 True 才视为有效
-                is_valid = result.get("is_valid") is True
+                raw_is_valid = result.get("is_valid")
+
+                # H3 修复：is_valid 为 None 时（_infer_validity_from_text 无法推断），
+                # 用原文特征做反向判断：含 % + 支付动词 → 强制保留，否则丢弃。
+                if raw_is_valid is None:
+                    force_valid = _should_force_valid_by_text_features(
+                        clause_input.get("clause"),
+                    )
+                    if force_valid:
+                        logger.info(
+                            f"条款验证兜底保留（LLM无法推断+原文特征命中）: ID={clause_id}"
+                        )
+                        is_valid = True
+                    else:
+                        logger.info(
+                            f"条款验证自动过滤（LLM无法推断+原文特征未命中）: ID={clause_id}"
+                        )
+                        is_valid = False
+                else:
+                    is_valid = raw_is_valid is True
 
                 # 白名单兜底：原文出现"节点关键词 + 紧邻百分比"形态时，强制保留
                 # 用于救回"提货款 95% + 垫付/退还"这类支付动词非典型的有效条款
@@ -1473,14 +1529,20 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
 
     # H3 修复：构建 prefix-30 hash 桶，回退匹配先在同桶内查找，
     # 避免 LLM 改写 id 时全量 N×M·L² 的相似度回退。
+    # Issue#1 修复：候选池排除 dedup_removed_ids，防止 fallback 误命中已被去重移除的 key，
+    # 导致最终 PaymentInfo.payment_clause 写入错误段落原文。
     _fallback_buckets: Dict[str, List[str]] = {}
     for _bk_key, _bk_item in summary_key_to_initial_item.items():
+        if _bk_key in dedup_removed_ids:
+            continue
         _bk_clause = str(_bk_item.get('payment_clause', '') or '').strip()
         if not _bk_clause:
             continue
         _bk_id = _bk_clause[:30]
         _fallback_buckets.setdefault(_bk_id, []).append(_bk_key)
-    _fallback_total_keys = list(summary_key_to_initial_item.keys())
+    _fallback_total_keys = [
+        k for k in summary_key_to_initial_item.keys() if k not in dedup_removed_ids
+    ]
     _fallback_hits = 0
     _fallback_misses = 0
 
@@ -1518,7 +1580,7 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
                 else:
                     _fallback_misses += 1
                 for map_key in _candidate_keys:
-                    if map_key in processed_ids:
+                    if map_key in processed_ids or map_key in dedup_removed_ids:
                         continue
                     map_item = summary_key_to_initial_item.get(map_key)
                     if not map_item:
@@ -1794,6 +1856,82 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
 
     # 复核结果后处理：算术校核（amount == 上下文唯一总价 → 100%）+ 零节点清理（ratio==0 且 amount==0 → 删除）
     final_payment_infos = _postprocess_final_payment_infos(final_payment_infos)
+
+    # ==================== Stage 7：付款时效 LLM 提取 + 特殊条款汇总 ====================
+    logger.info(f"{_NODE_TAG} 开始执行 Stage 7：付款时效提取与特殊条款汇总...")
+    payment_info_extractor_node.emit_running(
+        "正在提取付款天数 / 最迟付款节点 / 最迟付款时间...",
+        config,
+        progress=EXTRACTOR_STAGE_PROGRESS["payment_timing_extract"],
+    )
+
+    # (a) special_clause_content：所有 payment_clause 去重保序拼接
+    _seen_clauses: set = set()
+    _ordered_clauses: List[str] = []
+    for _info in final_payment_infos:
+        _c = (_info.payment_clause or "").strip()
+        if _c and _c not in _seen_clauses:
+            _seen_clauses.add(_c)
+            _ordered_clauses.append(_c)
+    special_clause_content = "\n".join(_ordered_clauses) if _ordered_clauses else None
+
+    # (b) 按 (clause, context, category) 唯一键并发调用 LLM 提取时效指标
+    timing_extractor = await get_summary_extractor(state.get("llm_config"))
+    _unique_pairs: Dict[Tuple[str, str, str], None] = {}
+    for _info in final_payment_infos:
+        _pair_key = (_info.payment_clause or "", _info.payment_context or "", _info.clause_category or "equipment_payment")
+        _unique_pairs.setdefault(_pair_key, None)
+    _pairs_list = list(_unique_pairs.keys())
+
+    timing_map: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    if _pairs_list:
+        _timing_tasks = [
+            timing_extractor.extract_payment_timing_single(k[0], k[1], clause_category=k[2])
+            for k in _pairs_list
+        ]
+        _timing_results = await asyncio.gather(*_timing_tasks, return_exceptions=True)
+        _default_timing = {"payment_days": None, "latest_payment_stage": None, "latest_payment_date": None}
+        for _pk, _tr in zip(_pairs_list, _timing_results):
+            if isinstance(_tr, Exception):
+                logger.warning(f"{_NODE_TAG} Stage 7 timing 异常: {_pk[0][:40]}...: {_tr}")
+                timing_map[_pk] = _default_timing
+            else:
+                timing_map[_pk] = _tr
+
+    # (c) 回写到每个 PaymentInfo
+    # 硬门控：latest_payment_stage / latest_payment_date 仅当 payment_clause 自身
+    # 字面包含"最迟"二字时才允许保留。否则即便 LLM 误抽（如被 payment_context 中
+    # 质保期"最迟不超过…"等无关语义污染），也强制置 null。
+    _stripped_count = 0
+    for _info in final_payment_infos:
+        _pair_key = (_info.payment_clause or "", _info.payment_context or "", _info.clause_category or "equipment_payment")
+        _t = timing_map.get(_pair_key, {})
+        _info.payment_days = _t.get("payment_days")
+        _has_zuichi = "最迟" in (_info.payment_clause or "")
+        if _has_zuichi:
+            _info.latest_payment_stage = _t.get("latest_payment_stage")
+            _info.latest_payment_date = _t.get("latest_payment_date")
+        else:
+            # 条款本身无"最迟"语义 → 强制清空，避免上下文污染
+            if _t.get("latest_payment_stage") is not None or _t.get("latest_payment_date") is not None:
+                _stripped_count += 1
+                logger.debug(
+                    f"{_NODE_TAG} Stage 7 硬门控生效：payment_clause 无'最迟'，"
+                    f"丢弃 LLM 输出 stage={_t.get('latest_payment_stage')}, "
+                    f"date={_t.get('latest_payment_date')}; clause前40字: {(_info.payment_clause or '')[:40]}"
+                )
+            _info.latest_payment_stage = None
+            _info.latest_payment_date = None
+        _info.special_clause_content = special_clause_content
+
+    if _stripped_count:
+        logger.info(f"{_NODE_TAG} Stage 7 硬门控共清理 {_stripped_count} 个误抽的 latest_* 字段")
+
+    logger.success(
+        f"{_NODE_TAG} Stage 7 完成: timing LLM 调用 {len(_pairs_list)} 次, "
+        f"覆盖 {len(final_payment_infos)} 个节点"
+    )
+    # ==================== Stage 7 结束 ====================
 
     # H8：思考过程仅通过返回值透传，不再直接 mutate state
     if thinking_info:

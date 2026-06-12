@@ -391,10 +391,10 @@ curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/extract_payment_info \
 | `payment_ratio` | float | 提取出的付款比例（百分比，如 `95.0` 表示 95%） |
 | `payment_amount` | string | 提取出的付款金额 |
 | `source` | string | 数据来源，固定为 `"AI提取"` |
-| `payment_days` | int/null | 占位字段（后续迭代补充） |
-| `latest_payment_stage` | string/null | 占位字段（后续迭代补充） |
-| `latest_payment_date` | string/null | 占位字段（后续迭代补充） |
-| `special_clause_content` | string/null | 占位字段（后续迭代补充） |
+| `payment_days` | int/null | 付款天数（correct 分支从提取结果回填，missed/false 为 null） |
+| `latest_payment_stage` | string/null | 最迟付款节点（correct 分支回填） |
+| `latest_payment_date` | int/null | 最迟付款时间-天数（correct 分支回填） |
+| `special_clause_content` | string/null | 特殊条款内容（文档级汇总，统一回填） |
 
 **MissedPaymentItem 对象字段**（`missed_payments` 数组元素）:
 
@@ -405,10 +405,10 @@ curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/extract_payment_info \
 | `payment_ratio` | float | 基准答案中的付款比例（百分比） |
 | `payment_amount` | string | 基准答案中的付款金额 |
 | `source` | string | 数据来源，固定为 `"SIS系统"` 或其他基准来源标识 |
-| `payment_days` | int/null | 占位字段（后续迭代补充） |
-| `latest_payment_stage` | string/null | 占位字段（后续迭代补充） |
-| `latest_payment_date` | string/null | 占位字段（后续迭代补充） |
-| `special_clause_content` | string/null | 占位字段（后续迭代补充） |
+| `payment_days` | int/null | 付款天数（missed 分支无提取来源，为 null） |
+| `latest_payment_stage` | string/null | 最迟付款节点（null） |
+| `latest_payment_date` | int/null | 最迟付款时间（null） |
+| `special_clause_content` | string/null | 特殊条款内容（文档级汇总） |
 
 **FalsePaymentItem 对象字段**（`false_payments` 数组元素）:
 
@@ -419,10 +419,10 @@ curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/extract_payment_info \
 | `payment_ratio` | float | 提取出的付款比例（百分比） |
 | `payment_amount` | string | 提取出的付款金额 |
 | `source` | string | 数据来源，固定为 `"AI提取"` |
-| `payment_days` | int/null | 占位字段（后续迭代补充） |
-| `latest_payment_stage` | string/null | 占位字段（后续迭代补充） |
-| `latest_payment_date` | string/null | 占位字段（后续迭代补充） |
-| `special_clause_content` | string/null | 占位字段（后续迭代补充） |
+| `payment_days` | int/null | 付款天数（false 分支无提取来源，为 null） |
+| `latest_payment_stage` | string/null | 最迟付款节点（null） |
+| `latest_payment_date` | int/null | 最迟付款时间（null） |
+| `special_clause_content` | string/null | 特殊条款内容（文档级汇总） |
 
 **EvaluationMetrics 对象字段**:
 
@@ -444,10 +444,10 @@ curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/extract_payment_info \
 | `payment_code` | string/null | 付款节点编码（与 `payment_type` 对应，如 `EARNEST`、`Z023`） |
 | `payment_ratio` | float/null | 付款比例（百分比） |
 | `payment_amount` | string/null | 付款金额 |
-| `payment_days` | int/null | **占位字段（后续迭代补充）** 付款天数（自付款触发条件起的天数） |
-| `latest_payment_stage` | string/null | **占位字段（后续迭代补充）** 最迟付款节点名称 |
-| `latest_payment_date` | string/null | **占位字段（后续迭代补充）** 最迟付款时间 |
-| `special_clause_content` | string/null | **占位字段（后续迭代补充）** 特殊条款内容 |
+| `payment_days` | int/null | 付款天数（自付款触发条件起的常规周期天数） |
+| `latest_payment_stage` | string/null | 最迟付款节点名称（事件/状态描述） |
+| `latest_payment_date` | int/null | 最迟付款时间（截止天数） |
+| `special_clause_content` | string/null | 特殊条款内容（文档内全部付款条款文本汇总） |
 
 **WarrantyItem 对象字段**:
 

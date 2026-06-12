@@ -22,8 +22,10 @@ from app.config.prompts_loader import (
     RESULT_VERIFICATION_SINGLE_GROUP_PROMPT,
     PAYMENT_CLAUSE_VALIDATION_PROMPT,
     PAYMENT_CLAUSE_CATEGORY_PROMPT,
+    PAYMENT_TIMING_EXTRACTION_PROMPT,
 )
 from app.config.config import APP_CONFIG
+from app.utils.token_counter import count_tokens
 from app.config.business_dict import get_business_dict
 from app.utils.concurrency import llm_guarded_ainvoke, LLM_CALL_TIMEOUT_SEC
 import json
@@ -75,6 +77,7 @@ class PaymentRatioExtractor:
             self.equipment_chain = equipment_prompt | self.llm
             self.install_chain = install_prompt | self.llm
             self.chain = self.equipment_chain  # 向后兼容
+            self._max_tokens_value = llm_max_tokens  # 供 token 截断逻辑使用
             self.is_ready = True
             self.current_config = llm_config
             
@@ -360,8 +363,8 @@ class PaymentRatioExtractor:
         if amount and str(amount).lower() not in ('null', 'none', ''):
             node["amount"] = str(amount)
         
-        # 至少要有ratio或amount才算有效节点
-        if node["ratio"] is None and node["amount"] is None:
+        # 至少要有 payment_type / ratio / amount 之一才算有效节点
+        if node["ratio"] is None and node["amount"] is None and not node.get("payment_type"):
             return None
         
         return node
@@ -404,6 +407,37 @@ class PaymentRatioExtractor:
                     )
             else:
                 rag_examples = "暂无参考示例"
+
+            # --- Token 感知截断：打印输入长度 + 超长时整体丢弃 RAG ---
+            # 微调模型 context_length = 16384
+            _MODEL_CTX_LIMIT = 16384
+            _llm_max_tokens = getattr(self, '_max_tokens_value', None) or 2048
+            # prompt 模板固定开销实测为 5000 tokens（含全部标准节点、规则说明、输出格式示例）
+            _PROMPT_TEMPLATE_OVERHEAD = 5000
+            _max_input_budget = _MODEL_CTX_LIMIT - _llm_max_tokens - _PROMPT_TEMPLATE_OVERHEAD
+
+            _clause_tokens = count_tokens(payment_clause)
+            _type_tokens = count_tokens(payment_type)
+            _chunk_tokens = count_tokens(current_clauses_chunk)
+            _rag_tokens = count_tokens(rag_examples)
+            _total_dynamic = _clause_tokens + _type_tokens + _chunk_tokens + _rag_tokens
+
+            # 直接打印输入长度供排查
+            logger.info(
+                f"[token_check] 动态输入 token 统计: clause={_clause_tokens}, type={_type_tokens}, "
+                f"chunk={_chunk_tokens}, rag={_rag_tokens}, 合计={_total_dynamic}, "
+                f"预算={_max_input_budget} (模型窗口={_MODEL_CTX_LIMIT} - max_tokens={_llm_max_tokens} - 模板={_PROMPT_TEMPLATE_OVERHEAD})"
+            )
+
+            if _total_dynamic > _max_input_budget:
+                # 超长 → 整体丢弃 RAG 示例
+                rag_examples = "暂无参考示例（因输入过长已丢弃）"
+                _new_total = _clause_tokens + _type_tokens + _chunk_tokens + count_tokens(rag_examples)
+                logger.warning(
+                    f"[token_truncate] 动态输入 {_total_dynamic} tokens 超预算 {_max_input_budget}，"
+                    f"已整体丢弃 RAG 示例 ({_rag_tokens} tokens) → 新合计 {_new_total} tokens"
+                )
+            # --- Token 感知截断结束 ---
                         
             # 4. 有条件地保存调试信息
             is_debug_mode = state.get("debug_mode", False)
@@ -412,12 +446,34 @@ class PaymentRatioExtractor:
             # 5. 选择对应分类的调用链并调用LLM
             selected_chain = self.install_chain if "installation" in clause_class else self.equipment_chain
             logger.debug(f"使用{'安装' if 'installation' in clause_class else '设备'}付款提示词")
-            response = await llm_guarded_ainvoke(selected_chain, {
+            invoke_input = {
                 "payment_clause": payment_clause,
                 "payment_type": payment_type,
                 "current_clauses_chunk": current_clauses_chunk,
                 "rag_examples": rag_examples,
-            })
+            }
+            # 瞬时错误重试：模型冷启动 / 上游错误响应 (KeyError('error') / 空响应等) 时自动重试 1 次。
+            # ChatOpenAI 自带的 max_retries 只覆盖 HTTP 层错误；这里补充对响应体异常的重试。
+            response = None
+            _last_invoke_err: Optional[Exception] = None
+            for _attempt in range(2):
+                try:
+                    response = await llm_guarded_ainvoke(selected_chain, invoke_input)
+                    _last_invoke_err = None
+                    break
+                except Exception as _invoke_err:  # noqa: BLE001
+                    _last_invoke_err = _invoke_err
+                    logger.warning(
+                        f"LLM 调用失败（第 {_attempt + 1}/2 次）: {type(_invoke_err).__name__}: {_invoke_err}"
+                    )
+                    if _attempt == 0:
+                        await asyncio.sleep(0.5)  # 短暂退避，避免连环失败
+            if response is None:
+                logger.error(
+                    f"LLM 调用连续 2 次失败，放弃提取本条款。最后异常: {_last_invoke_err}",
+                    exc_info=True,
+                )
+                return []
 
             # 6. 解析多节点结果
             response_text = str(getattr(response, "content", response)).strip()
@@ -695,6 +751,10 @@ class PaymentSummaryRatioExtractor:
             clause_validation_prompt_template = PromptTemplate(template=PAYMENT_CLAUSE_VALIDATION_PROMPT, input_variables=["validation_clauses"])
             clause_category_prompt_template = PromptTemplate(template=PAYMENT_CLAUSE_CATEGORY_PROMPT, input_variables=["category_clause"])
             result_verification_single_group_prompt_template = PromptTemplate(template=RESULT_VERIFICATION_SINGLE_GROUP_PROMPT, input_variables=["group_clauses"])
+            payment_timing_prompt_template = PromptTemplate(
+                template=PAYMENT_TIMING_EXTRACTION_PROMPT,
+                input_variables=["payment_clause", "payment_context", "clause_category", "standard_nodes"],
+            )
 
             # 【重要】我们不再链接脆弱的JsonOutputParser，而是手动解析
             self.llm_chain = prompt_template | llm
@@ -704,6 +764,7 @@ class PaymentSummaryRatioExtractor:
             self.clause_validation_llm_chain = clause_validation_prompt_template | llm
             self.clause_category_llm_chain = clause_category_prompt_template | llm
             self.result_verification_single_group_llm_chain = result_verification_single_group_prompt_template | llm
+            self.payment_timing_llm_chain = payment_timing_prompt_template | llm
 
             # 记录最终生效的 LLM 配置（用于 _should_reinitialize 比对）
             self.current_llm_config = {
@@ -2122,6 +2183,150 @@ class PaymentSummaryRatioExtractor:
             logger.warning(f"单组去重 LLM 调用异常: {e}，代码级兜底")
             return _code_fallback(f"LLM异常:{type(e).__name__}")
 
+    async def extract_payment_timing_single(
+        self,
+        payment_clause: str,
+        payment_context: str,
+        clause_category: str = "equipment_payment",
+    ) -> Dict[str, Any]:
+        """Stage 7：提取单条 (条款, 上下文) 的付款时效三指标。
+
+        输出字段：
+            payment_days (int|null)：常规付款周期（天）
+            latest_payment_stage (str|null)：最迟付款节点（必须从对应类别的标准节点白名单中选取，
+                且条款/上下文必须字面包含"最迟"二字）
+            latest_payment_date (int|null)：最迟付款时间（截止天数）
+
+        失败容忍：LLM 调用 / 解析异常一律降级为三字段全 null，不抛错。
+        """
+        default = {
+            "payment_days": None,
+            "latest_payment_stage": None,
+            "latest_payment_date": None,
+        }
+        if not getattr(self, "is_ready", False):
+            logger.warning("[timing] PaymentSummaryRatioExtractor 未就绪，返回 null")
+            return default
+
+        clause_text = (payment_clause or "").strip()
+        context_text = (payment_context or "").strip()
+        if not clause_text:
+            return default
+
+        # 加载对应类别的标准节点白名单（用于 prompt 注入 + 后置校验兜底）
+        try:
+            bd = get_business_dict()
+            if clause_category == "installation_payment":
+                whitelist_set = set(bd.install.payment_type_whitelist)
+            else:
+                whitelist_set = set(bd.equipment.payment_type_whitelist)
+            standard_nodes_str = " | ".join(sorted(whitelist_set))
+        except Exception as e:
+            logger.warning(f"[timing] 业务词典加载失败，跳过白名单约束: {e}")
+            whitelist_set = set()
+            standard_nodes_str = "（白名单不可用）"
+
+        # 硬约束：若条款 + 上下文均无"最迟"二字，直接返回 payment_days 由 LLM 提取，
+        # 但 latest_* 在后置阶段强制置 null，避免 LLM 越权臆测
+        full_text_for_check = f"{clause_text}\n{context_text}"
+        has_zui_chi = "最迟" in full_text_for_check
+
+        try:
+            response_obj = await llm_guarded_ainvoke(
+                self.payment_timing_llm_chain,
+                {
+                    "payment_clause": clause_text,
+                    "payment_context": context_text or clause_text,
+                    "clause_category": (
+                        "安装付款（installation_payment）"
+                        if clause_category == "installation_payment"
+                        else "设备付款（equipment_payment）"
+                    ),
+                    "standard_nodes": standard_nodes_str,
+                },
+            )
+            raw = str(getattr(response_obj, "content", response_obj)).strip()
+            cleaned = self._clean_json_string(raw)
+
+            data: Optional[Dict[str, Any]] = None
+            try:
+                data = json.loads(cleaned)
+            except Exception:
+                m = re.search(r"\{[^{}]*\}", cleaned, flags=re.DOTALL)
+                if m:
+                    try:
+                        data = json.loads(m.group(0))
+                    except Exception:
+                        data = None
+            if not isinstance(data, dict):
+                logger.warning(f"[timing] JSON 解析失败，原始输出: {raw[:200]}")
+                return default
+
+            def _coerce_int(v: Any) -> Optional[int]:
+                if v is None:
+                    return None
+                if isinstance(v, bool):
+                    return None
+                if isinstance(v, int):
+                    return v if v >= 0 else None
+                if isinstance(v, float):
+                    return int(v) if v >= 0 else None
+                if isinstance(v, str):
+                    s = v.strip()
+                    if not s or s.lower() in ("null", "none"):
+                        return None
+                    m = re.search(r"\d+", s)
+                    if m:
+                        try:
+                            n = int(m.group(0))
+                            return n if n >= 0 else None
+                        except Exception:
+                            return None
+                return None
+
+            def _coerce_str(v: Any) -> Optional[str]:
+                if v is None:
+                    return None
+                if isinstance(v, str):
+                    s = v.strip()
+                    if not s or s.lower() in ("null", "none"):
+                        return None
+                    return s
+                return None
+
+            payment_days = _coerce_int(data.get("payment_days"))
+            latest_stage = _coerce_str(data.get("latest_payment_stage"))
+            latest_date = _coerce_int(data.get("latest_payment_date"))
+
+            # ===== 后置硬约束兜底 =====
+            # (1) 条款无"最迟"二字 → latest_* 强制置 null（防止 LLM 把普通触发条件误当作最迟节点）
+            if not has_zui_chi:
+                if latest_stage is not None or latest_date is not None:
+                    logger.info(
+                        f"[timing] 条款无'最迟'二字，强制清空 latest_payment_stage='{latest_stage}', "
+                        f"latest_payment_date={latest_date} → null"
+                    )
+                latest_stage = None
+                latest_date = None
+
+            # (2) latest_payment_stage 不在白名单中 → 强制置 null
+            if latest_stage is not None and whitelist_set and latest_stage not in whitelist_set:
+                logger.info(
+                    f"[timing] latest_payment_stage='{latest_stage}' 不在 {clause_category} "
+                    f"白名单中，强制置 null"
+                )
+                latest_stage = None
+
+            return {
+                "payment_days": payment_days,
+                "latest_payment_stage": latest_stage,
+                "latest_payment_date": latest_date,
+            }
+        except Exception as e:
+            logger.warning(f"[timing] 提取异常: {type(e).__name__}: {e}")
+            return default
+
+
     def _parse_verification_output(self, llm_output: str) -> Tuple[List[str], str]:
         """
         解析校验LLM的输出，提取挑选出的ID列表和思考过程。
@@ -2342,25 +2547,22 @@ class PaymentSummaryRatioExtractor:
             return self._validation_fallback(original_clause, f"parse_exception: {type(e).__name__}")
 
     def _infer_validity_from_text(self, text: str, original_clause: Dict[str, Any]) -> Dict[str, Any]:
-        """从 LLM 输出的自然语言部分推断 is_valid。
+        """从LLM输出的自然语言部分推断 is_valid。
 
-        模型倾向于先输出判断理由（如 "仅描述支付方式...→ false"），
-        据此推断有效性：含否定判断关键词 → is_valid=False；否则 fail-open 保留。
+        策略：否定模式仅保留明确写出 "false" 的信号；
+        模糊判断词（如"无具体金额"）不再直接视为 false，
+        交由调用方用原文特征二次校验。
+
+        返回 dict: is_valid 可能为 True / False / None，
+        区分 "LLM明确判断false" 和 "无法推断"。
         """
         import re
         clause_id = original_clause.get("id", "")
 
-        # 否定判断指标：模型输出中含这些模式时视为 is_valid=False
+        # 否定判断指标：仅保留 LLM 明确写出 false 的信号（避免模糊判断词误杀）
         negative_patterns = [
             r'→\s*false',
             r'is_valid["\s:]*false',
-            r'无具体金额',
-            r'无具体比例',
-            r'概述性条款',
-            r'仅描述支付方式',
-            r'仅描述支付通道',
-            r'无支付动作',
-            r'非正常情境',
         ]
         for pat in negative_patterns:
             if re.search(pat, text, re.IGNORECASE):
@@ -2391,9 +2593,16 @@ class PaymentSummaryRatioExtractor:
                     "clause_context": original_clause.get("clause_context", ""),
                 }
 
-        # 无法推断，fail-open 保留
-        logger.debug(f"无法从LLM输出推断有效性，保留条款 ID={clause_id}")
-        return self._validation_fallback(original_clause, "cannot_infer")
+        # 无法推断 → 返回 None（与 fail-open 区分），交由调用方用原文特征决策
+        logger.debug(f"LLM输出无法明确推断有效性，返回 None, ID={clause_id}")
+        return {
+            "id": clause_id,
+            "is_valid": None,
+            "reason": "cannot_infer_from_text",
+            "text": original_clause.get("clause", ""),
+            "clause_class": original_clause.get("clause_class", ""),
+            "clause_context": original_clause.get("clause_context", ""),
+        }
 
     # ==================================================================================
     # 混签付款条款归属判定（仅对 clause_class 含 "混签付款条款" / "mixed_payment" 的条款触发）

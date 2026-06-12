@@ -23,6 +23,10 @@ const els = {
 let currentEventSource = null;
 let step1Paragraphs = [];  // 供 Step 2 按 clause 匹配 clause_context
 let lastPaymentItems = []; // 缓存最近一次 Step 2 的付款条款，用于一键复制
+let lastWarrantyItems = []; // 缓存最近一次 Step 2 的质保期条款
+let lastStep2Result = null; // 完整 Step 2 结果（供历史保存）
+let lastStep1Payload = null; // 完整 Step 1 payload（供历史保存）
+let lastTaskId = "";       // 最近一次任务 ID（用于重跑 Step 2）
 
 // ===== 耗时统计 =====
 const timers = {
@@ -102,6 +106,13 @@ function resetUI() {
   els.progressItems.forEach((li) => li.classList.remove("active", "done"));
   els.statusMsg.textContent = "";
   resetTimers();
+  setRerunBtnEnabled(false);
+}
+
+function setRerunBtnEnabled(enabled) {
+  const btn = document.getElementById("rerun-step2-btn");
+  if (!btn) return;
+  btn.disabled = !enabled;
 }
 
 function setStage(stage, state) {
@@ -135,6 +146,37 @@ function renderCtxCell(text) {
       <span class="context-full">${full}</span>
       <span class="toggle-ctx" onclick="this.parentNode.classList.toggle('expanded'); this.textContent = this.parentNode.classList.contains('expanded') ? '[收起]' : '[展开]';">[展开]</span>
     </div>`;
+}
+
+// ===== 条款原文截断 =====
+function renderClauseCell(text) {
+  if (!text) return '<span style="color:#9ca3af">—</span>';
+  const safe = esc(text);
+  return `<div class="clause-body">${safe}</div><span class="toggle-clause" onclick="toggleClauseCell(this)">[展开]</span>`;
+}
+
+function toggleClauseCell(el) {
+  const cell = el.closest('.clause-text');
+  if (!cell) return;
+  cell.classList.toggle('expanded');
+  el.textContent = cell.classList.contains('expanded') ? '[收起]' : '[展开]';
+}
+
+/** 隐藏不需要截断的条款原文的 toggle 按钮 */
+function pruneClauseToggles(scopeEl) {
+  requestAnimationFrame(() => {
+    (scopeEl || document).querySelectorAll('.clause-text').forEach((cell) => {
+      const body = cell.querySelector('.clause-body');
+      const toggle = cell.querySelector('.toggle-clause');
+      if (!body || !toggle) return;
+      // 内容未溢出则隐藏 toggle
+      if (body.scrollHeight <= body.clientHeight + 1) {
+        toggle.style.display = 'none';
+      } else {
+        toggle.style.display = '';
+      }
+    });
+  });
 }
 
 // ===== Step 1 渲染 =====
@@ -176,7 +218,7 @@ function renderStep1(payload) {
           <td class="idx">${i + 1}</td>
           <td><span class="${tagClass}">${esc(cls)}</span></td>
           <td><code class="orig-tag">${esc(origCls)}</code></td>
-          <td class="clause-text">${esc(p.clause || "")}</td>
+          <td class="clause-text">${renderClauseCell(p.clause || "")}</td>
           <td>${renderCtxCell(p.clause_context || "")}</td>
         </tr>`;
     });
@@ -185,6 +227,7 @@ function renderStep1(payload) {
 
   // 渲染全部条款展开区
   renderAllClauses(payload.all_clauses || []);
+  pruneClauseToggles(els.step1Card);
 }
 
 // ===== Step 1 全部条款（含其他类别） =====
@@ -252,9 +295,10 @@ function renderAllClausesTable() {
         <td class="idx">${i + 1}</td>
         <td><code class="orig-tag">${esc(classes)}</code></td>
         <td>${esc(conf)}</td>
-        <td class="clause-text">${esc(c.text || "")}</td>
+        <td class="clause-text">${renderClauseCell(c.text || "")}</td>
       </tr>`;
   }).join("");
+  pruneClauseToggles(document.getElementById("all-clauses-table"));
 }
 
 // ===== Step 2 渲染 =====
@@ -351,10 +395,15 @@ function renderStep2(result) {
   );
   const warrantyItems = extraction.filter((r) => r.warranty != null);
   lastPaymentItems = paymentItems;
+  lastWarrantyItems = warrantyItems;
+  lastStep2Result = result;
+  // 启用导出按钮
+  const exportBtn = document.getElementById("export-excel-btn");
+  if (exportBtn) exportBtn.disabled = !(paymentItems.length || warrantyItems.length);
 
   // 付款
   if (paymentItems.length === 0) {
-    els.paymentTbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:#9ca3af">无付款节点</td></tr>`;
+    els.paymentTbody.innerHTML = `<tr><td colspan="11" style="text-align:center;color:#9ca3af">无付款节点</td></tr>`;
   } else {
     els.paymentTbody.innerHTML = paymentItems.map((item, i) => {
       const clause = item.payment_clause || "";
@@ -364,12 +413,27 @@ function renderStep2(result) {
           <td class="idx">${i + 1}</td>
           <td><span class="tag">${esc(item.clause_category || "-")}</span></td>
           <td>${esc(item.payment_type || "-")}</td>
+          <td>${esc(item.payment_code ?? "-")}</td>
           <td>${esc(item.payment_ratio ?? "-")}</td>
           <td>${esc(item.payment_amount ?? "-")}</td>
-          <td class="clause-text">${esc(clause)}</td>
+          <td>${esc(item.payment_days ?? "-")}</td>
+          <td>${esc(item.latest_payment_stage ?? "-")}</td>
+          <td>${esc(item.latest_payment_date ?? "-")}</td>
+          <td class="clause-text">${renderClauseCell(clause)}</td>
           <td>${renderCtxCell(ctx)}</td>
         </tr>`;
     }).join("");
+  }
+
+  // 特殊条款内容（文档级汇总，取首条非空）
+  const specialClauseWrap = document.getElementById("special-clause-wrap");
+  const specialClauseEl = document.getElementById("special-clause-content");
+  const scc = paymentItems.find((it) => it.special_clause_content)?.special_clause_content;
+  if (scc && specialClauseWrap && specialClauseEl) {
+    specialClauseEl.textContent = scc;
+    specialClauseWrap.style.display = "block";
+  } else if (specialClauseWrap) {
+    specialClauseWrap.style.display = "none";
   }
 
   // 质保期
@@ -380,9 +444,10 @@ function renderStep2(result) {
       <tr>
         <td class="idx">${i + 1}</td>
         <td><span class="tag warranty">${esc(item.warranty || "-")}</span></td>
-        <td class="clause-text">${esc(item.warranty_clause || "-")}</td>
+        <td class="clause-text">${renderClauseCell(item.warranty_clause || "")}</td>
       </tr>`).join("");
   }
+  pruneClauseToggles(els.step2Card);
 }
 
 // ===== SSE 处理 =====
@@ -427,12 +492,17 @@ function startProcess(sessionId) {
 
   currentEventSource.addEventListener("step1", (evt) => {
     const payload = JSON.parse(evt.data);
+    lastStep1Payload = payload;
     if (timers.step1Start && timers.step1Elapsed == null) {
       timers.step1Elapsed = (performance.now() - timers.step1Start) / 1000;
     }
     renderStep1(payload);
     markStageDone("step1");
     updateTimerDisplay();
+    // Step 1 成功后开放"重新执行 Step 2"按钮（前提是有可用 paragraphs）
+    if ((payload.paragraphs || []).length > 0) {
+      setRerunBtnEnabled(true);
+    }
   });
 
   currentEventSource.addEventListener("step2", (evt) => {
@@ -467,6 +537,8 @@ function startProcess(sessionId) {
     els.submitBtn.disabled = false;
     els.statusMsg.textContent = "处理完成";
     stopTimerTicker();
+    // 保存到历史记录
+    saveToHistory();
   });
 
   currentEventSource.onerror = () => {
@@ -577,12 +649,16 @@ async function copyText(text, btn) {
 
 function copyStep2Payment(btn) {
   if (!lastPaymentItems.length) { alert("暂无付款条款数据"); return; }
-  const headers = ["类别", "阶段类型", "比例", "金额", "条款原文"];
+  const headers = ["类别", "阶段类型", "节点编码", "比例", "金额", "付款天数", "最迟付款节点", "最迟付款时间(天)", "条款原文"];
   const rows = lastPaymentItems.map((it) => [
     it.clause_category ?? "",
     it.payment_type ?? "",
+    it.payment_code ?? "",
     it.payment_ratio ?? "",
     it.payment_amount ?? "",
+    it.payment_days ?? "",
+    it.latest_payment_stage ?? "",
+    it.latest_payment_date ?? "",
     it.payment_clause ?? "",
   ]);
   copyText(buildTSV(headers, rows), btn);
@@ -606,3 +682,419 @@ document.getElementById("copy-step1-payment-btn")
   ?.addEventListener("click", (e) => copyStep1Payment(e.currentTarget));
 document.getElementById("copy-step2-payment-btn")
   ?.addEventListener("click", (e) => copyStep2Payment(e.currentTarget));
+
+// ===== 重新执行 Step 2 =====
+document.getElementById("rerun-step2-btn")?.addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  if (!step1Paragraphs.length) {
+    alert("Step 1 结果不可用（页面刷新后需重新执行完整流程）");
+    return;
+  }
+
+  btn.disabled = true;
+  els.errorCard.hidden = true;
+  els.errorBody.textContent = "";
+
+  // 显示带旋转动画和计时器的执行状态
+  const originalText = btn.textContent;
+  const rerunStart = performance.now();
+  let rerunTimerHandle = setInterval(() => {
+    const elapsed = ((performance.now() - rerunStart) / 1000).toFixed(1);
+    btn.innerHTML = `<span class="rerun-spinner"></span> 执行中 ${elapsed}s`;
+  }, 100);
+  btn.innerHTML = `<span class="rerun-spinner"></span> 执行中 0.0s`;
+
+  // 取前端 task_id 字段，或自动生成
+  const taskIdInput = document.getElementById("task_id");
+  const taskId = (taskIdInput && taskIdInput.value.trim()) || "";
+
+  try {
+    const resp = await fetch("/api/rerun-step2", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        paragraphs: step1Paragraphs,
+        task_id: taskId,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      showError(data.stage || "step2", data.error || `HTTP ${resp.status}`, data.detail);
+      return;
+    }
+    // 渲染新 Step 2 结果
+    renderStep2(data.result || {});
+    els.step2Card.hidden = false;
+    els.step2Card.scrollIntoView({ behavior: "smooth", block: "start" });
+    // 重跑 Step 2 成功后自动保存到历史记录
+    await saveToHistory();
+  } catch (err) {
+    showError("step2", `请求失败: ${err}`);
+  } finally {
+    clearInterval(rerunTimerHandle);
+    btn.textContent = originalText;
+    btn.disabled = false;
+  }
+});
+
+// ===== 历史记录 (SQLite API) =====
+
+const CONTRACT_TYPE_LABELS = {
+  installation: "安装合同",
+  equipment: "设备合同",
+  mixed: "混签合同",
+};
+
+async function saveToHistory() {
+  const s1 = lastStep1Payload;
+  if (!s1) return;
+
+  const extraction = (lastStep2Result && lastStep2Result.extraction_result) || [];
+  const payItems = extraction.filter(
+    (r) => r.payment_ratio != null || r.payment_clause
+  );
+
+  // 提取节点类型（中文）、比例、金额摘要
+  const typeSummary = payItems
+    .map((it) => it.payment_type || "-")
+    .filter((v) => v !== "-")
+    .join(", ");
+  const ratioSummary = payItems
+    .map((it) => it.payment_ratio)
+    .filter((v) => v != null && v !== "")
+    .join(", ");
+  const amountSummary = payItems
+    .map((it) => it.payment_amount)
+    .filter((v) => v != null && v !== "")
+    .join(", ");
+
+  const record = {
+    id: `hist-${Date.now()}`,
+    createdAt: new Date().toLocaleString("zh-CN"),
+    filename: s1.filename || "",
+    contractType: s1.contract_type || "",
+    contractTypeLabel: CONTRACT_TYPE_LABELS[s1.contract_type] || s1.contract_type || "",
+    typeSummary: typeSummary || "-",
+    ratioSummary: ratioSummary || "-",
+    amountSummary: amountSummary || "-",
+    step2Elapsed: (lastStep2Result && lastStep2Result._elapsed_seconds) || null,
+    paymentItems: payItems,
+    warrantyItems: extraction.filter((r) => r.warranty != null),
+    step1Data: s1,
+    step2Data: lastStep2Result || null,
+  };
+
+  try {
+    await fetch("/api/history", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(record),
+    });
+  } catch (e) {
+    console.warn("保存历史记录失败:", e);
+  }
+  await renderHistory();
+}
+
+async function renderHistory() {
+  const countEl = document.getElementById("history-count");
+  const tbody = document.querySelector("#history-table tbody");
+
+  let list = [];
+  try {
+    const resp = await fetch("/api/history");
+    if (resp.ok) list = await resp.json();
+  } catch (_) {}
+
+  if (countEl) countEl.textContent = `（共 ${list.length} 条）`;
+  if (!tbody) return;
+
+  // 更新批量导出按钮状态
+  updateBatchBtnState();
+
+  if (!list.length) {
+    tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:#9ca3af">暂无历史记录</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = list.map((r, i) => {
+    // 节点列：显示 payment_type（中文），逗号分隔
+    let typeStr = r.typeSummary || "-";
+    // 比例列
+    let ratioStr = r.ratioSummary || "-";
+    // 金额列
+    let amountStr = r.amountSummary || "-";
+    // 处理时间（Step 2）
+    const elapsed = r.step2Elapsed != null
+      ? (r.step2Elapsed >= 10 ? r.step2Elapsed.toFixed(1) + "s" : r.step2Elapsed.toFixed(2) + "s")
+      : "-";
+    return `
+    <tr>
+      <td style="text-align:center;"><input type="checkbox" class="hist-check" data-id="${esc(r.id)}" /></td>
+      <td class="idx">${i + 1}</td>
+      <td style="white-space:nowrap;font-size:12px;">${esc(r.createdAt)}</td>
+      <td title="${esc(r.filename)}">${esc(r.filename)}</td>
+      <td><span class="tag">${esc(r.contractTypeLabel)}</span></td>
+      <td style="font-size:12px;max-width:200px;word-break:break-word;">${esc(typeStr)}</td>
+      <td style="font-size:12px;">${esc(ratioStr)}</td>
+      <td style="font-size:12px;">${esc(amountStr)}</td>
+      <td style="font-size:12px;white-space:nowrap;">${esc(elapsed)}</td>
+      <td>
+        <button type="button" class="hist-view-btn" data-id="${esc(r.id)}">查看</button>
+        <button type="button" class="hist-del-btn" data-id="${esc(r.id)}">删除</button>
+      </td>
+    </tr>`;
+  }).join("");
+
+  // 事件绑定
+  tbody.querySelectorAll(".hist-view-btn").forEach((btn) => {
+    btn.addEventListener("click", () => viewHistory(btn.dataset.id));
+  });
+  tbody.querySelectorAll(".hist-del-btn").forEach((btn) => {
+    btn.addEventListener("click", () => deleteHistory(btn.dataset.id));
+  });
+  // 勾选框变化时更新批量导出按钮
+  tbody.querySelectorAll(".hist-check").forEach((cb) => {
+    cb.addEventListener("change", updateBatchBtnState);
+  });
+}
+
+function updateBatchBtnState() {
+  const batchBtn = document.getElementById("batch-export-history-btn");
+  if (!batchBtn) return;
+  const checks = document.querySelectorAll(".hist-check");
+  const anyChecked = Array.from(checks).some((cb) => cb.checked);
+  const allChecked = checks.length > 0 && Array.from(checks).every((cb) => cb.checked);
+  batchBtn.disabled = !anyChecked;
+  // 更新按钮文案显示选中数量
+  const checkedCount = Array.from(checks).filter((cb) => cb.checked).length;
+  batchBtn.textContent = checkedCount > 0
+    ? `批量导出 Excel（${checkedCount}条）`
+    : "批量导出 Excel";
+  // 同步全选框状态
+  const selectAll = document.getElementById("hist-select-all");
+  if (selectAll) selectAll.checked = allChecked;
+}
+
+async function viewHistory(id) {
+  let record;
+  try {
+    const resp = await fetch(`/api/history/${encodeURIComponent(id)}`);
+    if (!resp.ok) { alert("记录不存在"); return; }
+    record = await resp.json();
+  } catch (e) {
+    alert("加载记录失败: " + e);
+    return;
+  }
+
+  // 加载 Step 1 数据
+  if (record.step1Data) {
+    renderStep1(record.step1Data);
+    step1Paragraphs = record.step1Data.paragraphs || [];
+    lastStep1Payload = record.step1Data;
+    setRerunBtnEnabled((record.step1Data.paragraphs || []).length > 0);
+  }
+
+  // 加载 Step 2 数据
+  if (record.step2Data) {
+    renderStep2(record.step2Data);
+    lastStep2Result = record.step2Data;
+  } else {
+    els.step2Card.hidden = true;
+  }
+
+  // 滚动到 Step 1
+  els.step1Card.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function deleteHistory(id) {
+  try {
+    await fetch(`/api/history/${encodeURIComponent(id)}`, { method: "DELETE" });
+  } catch (_) {}
+  await renderHistory();
+}
+
+// 清空全部
+document.getElementById("clear-history-btn")?.addEventListener("click", async () => {
+  if (!confirm("确定清空全部历史记录？")) return;
+  try {
+    await fetch("/api/history", { method: "DELETE" });
+  } catch (_) {}
+  await renderHistory();
+});
+
+// 全选/取消全选
+document.getElementById("hist-select-all")?.addEventListener("change", (e) => {
+  const checked = e.target.checked;
+  document.querySelectorAll(".hist-check").forEach((cb) => { cb.checked = checked; });
+  updateBatchBtnState();
+});
+
+// 批量导出历史记录到 Excel（通过后端 API 直接处理）
+async function batchExportHistory() {
+  const checks = document.querySelectorAll(".hist-check:checked");
+  const ids = Array.from(checks).map((cb) => cb.dataset.id);
+  if (!ids.length) { alert("请先勾选要导出的历史记录"); return; }
+
+  const btn = document.getElementById("batch-export-history-btn");
+  if (btn) { btn.disabled = true; btn.textContent = "导出中..."; }
+
+  try {
+    const resp = await fetch("/api/history/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    });
+
+    if (!resp.ok) {
+      const errData = await resp.json().catch(() => ({}));
+      alert(errData.error || `导出失败: HTTP ${resp.status}`);
+      return;
+    }
+
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `history_export_${new Date().toISOString().slice(0,10)}.xlsx`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    alert(`批量导出失败: ${err}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "批量导出 Excel"; }
+  }
+}
+
+document.getElementById("batch-export-history-btn")?.addEventListener("click", batchExportHistory);
+
+// 页面加载时渲染历史
+renderHistory();
+
+// ===== Excel 导出 =====
+const PAYMENT_EXPORT_FIELDS = [
+  { key: "clause_category", label: "类别" },
+  { key: "payment_type", label: "阶段类型" },
+  { key: "payment_code", label: "节点编码" },
+  { key: "payment_ratio", label: "比例" },
+  { key: "payment_amount", label: "金额" },
+  { key: "payment_days", label: "付款天数" },
+  { key: "latest_payment_stage", label: "最迟付款节点" },
+  { key: "latest_payment_date", label: "最迟付款时间(天)" },
+  { key: "payment_clause", label: "条款原文" },
+  { key: "payment_context", label: "上下文" },
+];
+const WARRANTY_EXPORT_FIELDS = [
+  { key: "warranty", label: "质保期" },
+  { key: "warranty_clause", label: "条款原文" },
+];
+
+function openExportModal() {
+  const modal = document.getElementById("export-modal");
+  if (!modal) return;
+
+  // 渲染付款字段复选框
+  const payBox = document.getElementById("payment-field-checkboxes");
+  payBox.innerHTML = PAYMENT_EXPORT_FIELDS.map((f) => `
+    <label><input type="checkbox" value="${f.key}" data-group="payment" checked /> ${esc(f.label)}</label>
+  `).join("");
+
+  // 渲染质保期字段复选框
+  const warBox = document.getElementById("warranty-field-checkboxes");
+  warBox.innerHTML = WARRANTY_EXPORT_FIELDS.map((f) => `
+    <label><input type="checkbox" value="${f.key}" data-group="warranty" checked /> ${esc(f.label)}</label>
+  `).join("");
+
+  modal.hidden = false;
+}
+
+function closeExportModal() {
+  const modal = document.getElementById("export-modal");
+  if (modal) modal.hidden = true;
+}
+
+// 全选 / 全不选
+document.querySelectorAll(".select-all-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const group = btn.dataset.target;
+    document.querySelectorAll(`input[data-group="${group}"]`).forEach((cb) => { cb.checked = true; });
+  });
+});
+document.querySelectorAll(".select-none-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const group = btn.dataset.target;
+    document.querySelectorAll(`input[data-group="${group}"]`).forEach((cb) => { cb.checked = false; });
+  });
+});
+
+// 确认导出
+async function doExport() {
+  const selectedPayment = Array.from(
+    document.querySelectorAll('input[data-group="payment"]:checked')
+  ).map((cb) => cb.value);
+  const selectedWarranty = Array.from(
+    document.querySelectorAll('input[data-group="warranty"]:checked')
+  ).map((cb) => cb.value);
+
+  if (!selectedPayment.length && !selectedWarranty.length) {
+    alert("请至少选择一个导出字段");
+    return;
+  }
+
+  // 为付款条目补充上下文字段（从 step1Paragraphs 匹配）
+  const enrichedPayment = lastPaymentItems.map((it) => {
+    const ctx = findContextByClause(it.payment_clause) || it.payment_context || "";
+    return { ...it, payment_context: ctx };
+  });
+
+  const confirmBtn = document.getElementById("export-modal-confirm");
+  if (confirmBtn) { confirmBtn.disabled = true; confirmBtn.textContent = "生成中..."; }
+
+  try {
+    const resp = await fetch("/api/export-excel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        payment_items: enrichedPayment,
+        warranty_items: lastWarrantyItems,
+        payment_fields: selectedPayment,
+        warranty_fields: selectedWarranty,
+      }),
+    });
+
+    if (!resp.ok) {
+      const errData = await resp.json().catch(() => ({}));
+      alert(errData.error || `导出失败: HTTP ${resp.status}`);
+      return;
+    }
+
+    // 下载文件
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = resp.headers.get("Content-Disposition")?.split("filename=")[1]
+      || `payment_export_${Date.now()}.xlsx`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    closeExportModal();
+  } catch (err) {
+    alert(`导出失败: ${err}`);
+  } finally {
+    if (confirmBtn) { confirmBtn.disabled = false; confirmBtn.textContent = "确认导出"; }
+  }
+}
+
+// 事件绑定
+document.getElementById("export-excel-btn")?.addEventListener("click", openExportModal);
+document.getElementById("export-modal-close")?.addEventListener("click", closeExportModal);
+document.getElementById("export-modal-cancel")?.addEventListener("click", closeExportModal);
+document.getElementById("export-modal-confirm")?.addEventListener("click", doExport);
+// 点击蒙层关闭
+document.getElementById("export-modal")?.addEventListener("click", (e) => {
+  if (e.target === e.currentTarget) closeExportModal();
+});

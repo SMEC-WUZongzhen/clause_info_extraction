@@ -83,7 +83,7 @@ force_valid:
     - "安装费"
     - "设备款"
     - "设备款项"
-  # 11 个排除关键词（命中则不允许 force_valid）
+  # 12 个排除关键词（命中则不允许 force_valid）
   exclude_keywords:
     - "违约金"
     - "罚款"
@@ -96,6 +96,7 @@ force_valid:
     - "质保期保养预留费"
     - "保养预留款"
     - "保养预留费"
+    - "税率"
 
 # --- 条款预过滤默认关键词（H8，对应 env 变量 CLAUSE_FILTER_KEYWORDS） ---
 clause_filter:

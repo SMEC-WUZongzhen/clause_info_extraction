@@ -1,0 +1,6 @@
+# SQLite 数据库文件
+history.db
+history.db-wal
+history.db-shm
+__pycache__/
+*.pyc

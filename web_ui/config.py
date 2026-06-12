@@ -61,9 +61,9 @@ def set_service2_mode(mode: str) -> dict:
     return SERVICE2_CONFIG
 
 # ===== Pipeline 参数 =====
-LINES_PER_CHUNK = _env("LINES_PER_CHUNK", 200)
+LINES_PER_CHUNK = _env("LINES_PER_CHUNK", 300)
 LLM_TIMEOUT = _env("LLM_TIMEOUT", 300)
-MAX_CONTEXT_CHARS = _env("MAX_CONTEXT_CHARS", 400)
+MAX_CONTEXT_CHARS = _env("MAX_CONTEXT_CHARS", 700)
 MAX_WORKERS = _env("PIPELINE_MAX_WORKERS", 4)
 
 # ===== Web 参数 =====
