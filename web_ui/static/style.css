@@ -1163,3 +1163,229 @@ button[type="submit"]:disabled {
 }
 .submit-btn:hover { background: var(--forest-deep); }
 .submit-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+/* =========================================================================
+   操作模式 radio（两列布局）
+   ========================================================================= */
+.field:has(input[name="operation_type"]) .radio-group {
+  grid-template-columns: 1fr 1fr;
+}
+
+/* =========================================================================
+   GT 真值输入表格
+   ========================================================================= */
+.gt-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--paper);
+  margin-bottom: 10px;
+}
+.gt-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.gt-table thead th {
+  background: var(--ink);
+  color: var(--paper);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 10px 12px;
+  text-align: left;
+  white-space: nowrap;
+}
+.gt-table tbody td {
+  border-top: 1px solid var(--hairline);
+  padding: 6px 8px;
+  vertical-align: middle;
+}
+.gt-table select.gt-category {
+  width: 100%;
+  padding: 7px 8px;
+  border: 1px solid var(--hairline-2);
+  border-bottom: 1.5px solid var(--ink);
+  border-radius: 0;
+  font-size: 12px;
+  font-family: var(--sans);
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+  transition: border-color .2s;
+}
+.gt-table select.gt-category:focus {
+  outline: none;
+  border-bottom-color: var(--forest);
+}
+.gt-table input[type="text"] {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--hairline-2);
+  border-bottom: 1.5px solid var(--ink);
+  border-radius: 0;
+  font-size: 13px;
+  font-family: var(--mono);
+  background: var(--surface);
+  color: var(--ink);
+  transition: border-color .2s;
+}
+.gt-table input[type="text"]:focus {
+  outline: none;
+  border-bottom-color: var(--forest);
+}
+.gt-table input[type="text"]::placeholder {
+  color: var(--muted);
+  font-style: italic;
+}
+#gt-add-row-btn {
+  margin-top: 4px;
+  font-size: 11px;
+}
+.gt-hint {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+  font-style: italic;
+}
+
+/* =========================================================================
+   对比结果区域
+   ========================================================================= */
+.section-divider {
+  border: none;
+  border-top: 1.5px dashed var(--hairline-2);
+  margin: 28px 0 20px;
+}
+.compare-title {
+  color: var(--forest-deep);
+}
+.compare-subtitle {
+  margin: 18px 0 8px;
+  font-family: var(--sans);
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.06em;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.compare-subtitle small {
+  font-weight: 400;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.correct-title { color: #1a6b3c; }
+.missed-title  { color: #8a6d00; }
+.false-title   { color: var(--crimson); }
+
+/* 评估指标卡片 */
+.eval-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+  margin: 14px 0 22px;
+}
+.metric-card {
+  background: var(--paper);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  text-align: center;
+}
+.metric-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.metric-value {
+  font-family: var(--serif);
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--forest);
+}
+
+/* 合并对比表格样式 */
+.merged-compare-table .row-correct td { border-left-color: #1a6b3c; }
+.merged-compare-table .row-correct:hover td { background: #eaf7ef; }
+.merged-compare-table .row-false td { border-left-color: var(--crimson); }
+.merged-compare-table .row-false:hover td { background: #fce8e8; }
+.merged-compare-table .row-missed td { border-left-color: #8a6d00; }
+.merged-compare-table .row-missed:hover td { background: #fdf6e3; }
+.row-missed-header td {
+  background: #fef3cd;
+  color: #8a6d00;
+  font-weight: 700;
+  font-size: 12px;
+  text-align: center;
+  padding: 8px 12px;
+  letter-spacing: 0.06em;
+  border-top: 2px dashed #8a6d00;
+}
+.compare-status {
+  display: inline-block;
+  width: 22px;
+  height: 22px;
+  line-height: 22px;
+  text-align: center;
+  border-radius: 50%;
+  font-size: 13px;
+  font-weight: 700;
+}
+.status-correct {
+  color: #fff;
+  background: #1a6b3c;
+}
+.status-false {
+  color: #fff;
+  background: var(--crimson);
+}
+.status-missed {
+  color: #8a6d00;
+  background: #fef3cd;
+  border: 1.5px solid #8a6d00;
+}
+
+@media (max-width: 600px) {
+  .eval-metrics { grid-template-columns: 1fr 1fr; }
+}
+
+/* =========================================================================
+   历史记录 Tab 标签页
+   ========================================================================= */
+.history-tabs {
+  display: flex;
+  gap: 0;
+  border-top: 1px solid var(--hairline);
+  padding: 0;
+}
+.tab-btn {
+  flex: 1;
+  padding: 11px 18px;
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  border: none;
+  border-bottom: 2.5px solid transparent;
+  background: var(--paper);
+  color: var(--muted);
+  cursor: pointer;
+  transition: all .2s;
+}
+.tab-btn:hover {
+  color: var(--forest);
+  background: var(--forest-soft);
+}
+.tab-btn.active {
+  color: var(--forest-deep);
+  border-bottom-color: var(--forest);
+  background: var(--surface);
+}

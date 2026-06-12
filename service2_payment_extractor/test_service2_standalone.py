@@ -184,7 +184,7 @@ def call_service2(
     record_id: str,
     paragraphs: List[Dict[str, Any]],
     operation_type: str = "extract",
-    gt_payment_stages: Optional[List[Dict[str, Any]]] = None,
+    sis_payment_stages: Optional[List[Dict[str, Any]]] = None,
     debug: bool = True
 ) -> Dict[str, Any]:
     """
@@ -193,7 +193,7 @@ def call_service2(
     :param record_id: 请求的唯一标识
     :param paragraphs: Service 1 输出的段落列表
     :param operation_type: 'extract'（仅提取）或 'analyze'（提取并对比）
-    :param gt_payment_stages: Ground Truth 数据（仅 analyze 模式需要）
+    :param sis_payment_stages: Ground Truth 数据（仅 analyze 模式需要）
     :param debug: 是否打印调试信息
     :return: Service 2 的响应
     """
@@ -205,9 +205,9 @@ def call_service2(
     }
 
     if operation_type == "analyze":
-        if not gt_payment_stages:
-            raise ValueError("'analyze' 操作需要提供 gt_payment_stages")
-        payload["gt_payment_stages"] = gt_payment_stages
+        if not sis_payment_stages:
+            raise ValueError("'analyze' 操作需要提供 sis_payment_stages")
+        payload["sis_payment_stages"] = sis_payment_stages
 
     # 打印请求摘要
     if debug:
@@ -224,8 +224,8 @@ def call_service2(
             print(f"  [{i + 1}] [{cls}]")
             print(f"      {text_preview}{'...' if len(p.get('clause') or p.get('text') or '') > 80 else ''}")
         if operation_type == "analyze":
-            print(f"\n>>> GT节点数: {len(gt_payment_stages)}")
-            for gt in gt_payment_stages:
+            print(f"\n>>> GT节点数: {len(sis_payment_stages)}")
+            for gt in sis_payment_stages:
                 print(f"  - {gt['stage']}: {gt['ratio']} / {gt['stage_amount']}")
         print(f"{'=' * 80}")
 
@@ -393,7 +393,7 @@ def run_analyze_mode():
         record_id="test_service2_analyze",
         paragraphs=SERVICE1_OUTPUT_PARAGRAPHS,
         operation_type="analyze",
-        gt_payment_stages=GT_PAYMENT_STAGES,
+        sis_payment_stages=GT_PAYMENT_STAGES,
         debug=True
     )
 
@@ -406,7 +406,7 @@ def run_analyze_mode():
 
 
 def run_batch_dir(batch_dir: str, record_id: str, operation_type: str = "extract",
-                   gt_payment_stages: Optional[List[Dict[str, Any]]] = None,
+                   sis_payment_stages: Optional[List[Dict[str, Any]]] = None,
                    raw: bool = False):
     """
     批量处理文件夹内所有 JSON 文件，汇总所有段落后一次性调用 Service 2，
@@ -416,7 +416,7 @@ def run_batch_dir(batch_dir: str, record_id: str, operation_type: str = "extract
         batch_dir: 包含多个 JSON 文件的文件夹路径
         record_id: 请求 ID 前缀
         operation_type: extract 或 analyze
-        gt_payment_stages: GT 数据（仅 analyze 模式）
+        sis_payment_stages: GT 数据（仅 analyze 模式）
         raw: 是否打印原始 JSON
     """
     import glob
@@ -484,7 +484,7 @@ def run_batch_dir(batch_dir: str, record_id: str, operation_type: str = "extract
         record_id=record_id,
         paragraphs=all_paragraphs,
         operation_type=operation_type,
-        gt_payment_stages=gt_payment_stages if operation_type == "analyze" else None,
+        sis_payment_stages=sis_payment_stages if operation_type == "analyze" else None,
         debug=False
     )
 
@@ -631,7 +631,7 @@ if __name__ == "__main__":
                     batch_dir=subdir_path,
                     record_id=args.id,
                     operation_type=args.mode,
-                    gt_payment_stages=GT_PAYMENT_STAGES if args.mode == "analyze" else None,
+                    sis_payment_stages=GT_PAYMENT_STAGES if args.mode == "analyze" else None,
                     raw=args.raw
                 )
                 print(f">>> [{idx}/{len(subdirs)}] 文件夹 {subdir} 处理完成")
@@ -644,7 +644,7 @@ if __name__ == "__main__":
                 batch_dir=batch_path,
                 record_id=args.id,
                 operation_type=args.mode,
-                gt_payment_stages=GT_PAYMENT_STAGES if args.mode == "analyze" else None,
+                sis_payment_stages=GT_PAYMENT_STAGES if args.mode == "analyze" else None,
                 raw=args.raw
             )
         exit(0)
@@ -658,7 +658,7 @@ if __name__ == "__main__":
             record_id=args.id,
             paragraphs=paragraphs,
             operation_type="analyze",
-            gt_payment_stages=GT_PAYMENT_STAGES,
+            sis_payment_stages=GT_PAYMENT_STAGES,
             debug=False
         )
     else:

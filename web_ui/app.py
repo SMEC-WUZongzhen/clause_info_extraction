@@ -133,6 +133,20 @@ def upload():
 
     skip_service2 = (request.form.get("skip_service2") or "").strip().lower() in ("1", "true", "on", "yes")
 
+    # 可选参数：操作模式（extract / analyze）和真值数据
+    operation_type = (request.form.get("operation_type") or "extract").strip()
+    if operation_type not in ("extract", "analyze"):
+        operation_type = "extract"
+    gt_json_raw = (request.form.get("gt_json") or "").strip()
+    sis_payment_stages = None
+    if operation_type == "analyze" and gt_json_raw:
+        try:
+            sis_payment_stages = json.loads(gt_json_raw)
+            if not isinstance(sis_payment_stages, list):
+                sis_payment_stages = None
+        except json.JSONDecodeError:
+            sis_payment_stages = None
+
     # 可选参数：任务 ID（留空则在 /api/process 中默认生成 webui-{时间戳}）
     task_id_raw = (request.form.get("task_id") or "").strip()
     if len(task_id_raw) > 128:
@@ -156,6 +170,8 @@ def upload():
             "lines_per_chunk": lines_per_chunk,
             "max_chars": max_chars,
             "skip_service2": skip_service2,
+            "operation_type": operation_type,
+            "sis_payment_stages": sis_payment_stages,
             "task_id": task_id_raw,
             "created_at": time.time(),
         }
@@ -191,6 +207,8 @@ def process():
     lines_per_chunk = session.get("lines_per_chunk") or config.LINES_PER_CHUNK
     max_chars = session.get("max_chars") or config.MAX_CONTEXT_CHARS
     skip_service2 = bool(session.get("skip_service2"))
+    operation_type = session.get("operation_type") or "extract"
+    sis_payment_stages = session.get("sis_payment_stages")
     # 优先使用前端指定的 task_id；未指定则默认生成 webui-{时间戳}
     task_id = (session.get("task_id") or "").strip() or f"webui-{int(time.time())}"
 
@@ -303,7 +321,11 @@ def process():
 
         yield _sse("status", {"stage": "step2_running", "message": "Service 2 处理中..."})
         try:
-            step2 = pipeline.run_step2(paragraphs, task_id)
+            step2 = pipeline.run_step2(
+                paragraphs, task_id,
+                operation_type=operation_type,
+                sis_payment_stages=sis_payment_stages,
+            )
         except pipeline.PipelineError as e:
             yield _sse("error", {"stage": e.stage, "message": e.message, "detail": e.detail})
             yield _sse("done", {})
@@ -330,7 +352,9 @@ def rerun_step2():
     Body (JSON):
         {
           "paragraphs": [...],   # 已应用 contract_type 后的 paragraphs（来自前端缓存）
-          "task_id": "xxx"       # 可选；留空自动生成 webui-rerun-{时间戳}
+          "task_id": "xxx",      # 可选；留空自动生成 webui-rerun-{时间戳}
+          "operation_type": "extract" | "analyze",  # 可选，默认 extract
+          "sis_payment_stages": [...]                # analyze 模式需要
         }
     """
     data = request.get_json(silent=True) or {}
@@ -345,8 +369,17 @@ def rerun_step2():
         return jsonify({"error": "task_id 长度不能超过 128"}), 400
     task_id = task_id_raw or f"webui-rerun-{int(time.time())}"
 
+    operation_type = (data.get("operation_type") or "extract").strip()
+    if operation_type not in ("extract", "analyze"):
+        operation_type = "extract"
+    sis_payment_stages = data.get("sis_payment_stages") if operation_type == "analyze" else None
+
     try:
-        result = pipeline.run_step2(paragraphs, task_id)
+        result = pipeline.run_step2(
+            paragraphs, task_id,
+            operation_type=operation_type,
+            sis_payment_stages=sis_payment_stages,
+        )
     except pipeline.PipelineError as e:
         return jsonify({"error": e.message, "stage": e.stage, "detail": e.detail}), 502
     except Exception as e:
@@ -470,8 +503,9 @@ def export_excel():
 
 @app.get("/api/history")
 def api_history_list():
-    """列表（仅摘要，不含大 JSON 字段）。"""
-    records = history_store.list_records()
+    """列表（仅摘要，不含大 JSON 字段）。可通过 ?type=extract|compare 过滤。"""
+    op_type = request.args.get("type", "").strip() or None
+    records = history_store.list_records(operation_type=op_type)
     return jsonify(records)
 
 
@@ -503,8 +537,9 @@ def api_history_delete(record_id: str):
 
 @app.delete("/api/history")
 def api_history_clear():
-    """清空全部记录。"""
-    count = history_store.delete_all()
+    """清空记录。可通过 ?type=extract|compare 仅清空指定类型。"""
+    op_type = request.args.get("type", "").strip() or None
+    count = history_store.delete_all(operation_type=op_type)
     return jsonify({"ok": True, "deleted_count": count})
 
 

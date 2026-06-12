@@ -297,16 +297,27 @@ def apply_contract_type(paragraphs: List[Dict[str, Any]],
 # ============================================================
 # Step 2: Service 2 远程调用
 # ============================================================
-def run_step2(paragraphs: List[Dict[str, Any]], task_id: str) -> Dict[str, Any]:
-    """调用远程 Service 2 /extract_payment_info，返回解析后的 JSON。"""
+def run_step2(paragraphs: List[Dict[str, Any]], task_id: str,
+              operation_type: str = "extract",
+              sis_payment_stages: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """调用远程 Service 2 /extract_payment_info，返回解析后的 JSON。
+
+    Args:
+        paragraphs: 合同条款段落列表
+        task_id: 任务 ID
+        operation_type: 操作类型，"extract"(仅提取) 或 "analyze"(提取并比对)
+        sis_payment_stages: 标准答案列表，仅 operation_type="analyze" 时需要
+    """
     cfg = config.SERVICE2_CONFIG
     url = f"{cfg['base_url'].rstrip('/')}{cfg['endpoint']}"
 
     payload = {
         "id": task_id,
         "paragraphs": paragraphs,
-        "operation_type": "extract",
+        "operation_type": operation_type,
     }
+    if operation_type == "analyze" and sis_payment_stages:
+        payload["sis_payment_stages"] = sis_payment_stages
     headers = {"Content-Type": "application/json"}
     if cfg.get("api_key"):
         headers["Authorization"] = f"Bearer {cfg['api_key']}"

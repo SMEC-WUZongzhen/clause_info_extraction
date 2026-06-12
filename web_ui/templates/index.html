@@ -51,6 +51,43 @@
         </div>
 
         <div class="field">
+          <label>操作模式</label>
+          <div class="radio-group">
+            <label class="radio">
+              <input type="radio" name="operation_type" value="extract" checked />
+              <span>提取</span>
+              <small>仅提取付款节点信息</small>
+            </label>
+            <label class="radio">
+              <input type="radio" name="operation_type" value="analyze" />
+              <span>对比</span>
+              <small>提取并与真值对比，输出评估报告</small>
+            </label>
+          </div>
+        </div>
+
+        <!-- 真值输入区域（对比模式） -->
+        <div class="field" id="gt-section" hidden>
+          <label>真值数据（Ground Truth）</label>
+          <div class="gt-table-wrap">
+            <table class="data-table gt-table" id="gt-table">
+              <thead>
+                <tr>
+                  <th>节点名称 <small>(stage)</small></th>
+                  <th>节点类型 <small>(category)</small></th>
+                  <th>比例 <small>(ratio %)</small></th>
+                  <th>金额 <small>(stage_amount)</small></th>
+                  <th style="width:60px;">操作</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <button type="button" id="gt-add-row-btn" class="copy-btn">+ 添加一行</button>
+          <p class="gt-hint">提示：比例和金额至少填一个。比例支持 30 或 30% 格式。</p>
+        </div>
+
+        <div class="field">
           <label>处理参数（可选，留空使用默认值）</label>
           <div class="param-group">
             <div class="param-item">
@@ -89,6 +126,10 @@
           <span class="toggle-text">历史记录</span>
           <span class="all-count" id="history-count"></span>
         </summary>
+        <div class="history-tabs">
+          <button type="button" class="tab-btn active" data-tab="extract">提取</button>
+          <button type="button" class="tab-btn" data-tab="analyze">对比</button>
+        </div>
         <div class="history-toolbar">
           <button type="button" id="batch-export-history-btn" class="copy-btn" disabled>批量导出 Excel</button>
           <button type="button" id="clear-history-btn" class="copy-btn">清空全部</button>
@@ -234,6 +275,30 @@
           </thead>
           <tbody></tbody>
         </table>
+      </div>
+
+      <!-- 对比结果区域（analyze 模式） -->
+      <div id="compare-result-section" hidden>
+        <hr class="section-divider" />
+        <h3 class="section-title compare-title">对比评估结果</h3>
+        <div class="eval-metrics" id="eval-metrics"></div>
+
+        <div class="table-wrap">
+          <table class="data-table compare-table merged-compare-table" id="merged-compare-table">
+            <thead>
+              <tr>
+                <th style="width:30px;">#</th>
+                <th style="width:50px;">状态</th>
+                <th>节点类型</th>
+                <th>节点名称</th>
+                <th>节点编码</th>
+                <th>比例</th>
+                <th>金额</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
       </div>
     </section>
   </main>

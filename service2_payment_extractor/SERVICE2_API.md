@@ -112,7 +112,7 @@ Content-Type: application/json
 | `id` | string | ✅ | 任务唯一标识符 |
 | `paragraphs` | array[object] | ✅ | 合同条款段落列表 |
 | `operation_type` | string | ❌ | 操作类型：`"extract"`（仅提取）或 `"analyze"`（提取并比对），默认 `"extract"` |
-| `gt_payment_stages` | array[object] | 条件必填 | 标准答案列表，`operation_type="analyze"` 时必填 |
+| `sis_payment_stages` | array[object] | 条件必填 | 标准答案列表，`operation_type="analyze"` 时必填 |
 
 **ParagraphInput 对象结构**:
 
@@ -187,7 +187,7 @@ curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/extract_payment_info \
         "clause_class": ["设备付款条款"]
       }
     ],
-    "gt_payment_stages": [
+    "sis_payment_stages": [
       {
         "stage": "合同定金",
         "ratio": "20%",
@@ -462,7 +462,7 @@ curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/extract_payment_info \
 
 ```json
 {
-  "detail": "'analyze' 操作必须提供 'gt_payment_stages'。"
+  "detail": "'analyze' 操作必须提供 'sis_payment_stages'。"
 }
 ```
 
@@ -472,7 +472,7 @@ curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/extract_payment_info \
 {
   "detail": [
     {
-      "loc": ["body", "gt_payment_stages", 0],
+      "loc": ["body", "sis_payment_stages", 0],
       "msg": "'ratio' 和 'stage_amount' 必须至少提供一个。",
       "type": "value_error"
     }
@@ -542,6 +542,78 @@ curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/v1/chat/completions \
 ```
 
 > **注意**: `/v1/chat/completions` 接口适合作为 OpenAI 兼容客户端（如 LangChain、AutoGen 等）的后端使用。对于结构化的 API 调用，建议仍使用 `POST /extract_payment_info` 接口。
+
+---
+
+### 4. 合同总金额一致性比对
+
+**端点**: `POST /compare_contract_price`
+
+**描述**: 调用 LLM 从「合同总价条款」文本中提取合同总金额，并与 SIS 系统中记录的合同金额做硬编码差值比对（阈值固定为 `10.0` 元，不可配置）。
+
+#### 请求参数
+
+##### 请求头
+```
+Content-Type: application/json
+```
+
+##### 请求体 (JSON)
+
+| 字段 | 类型 | 必填 | 描述 |
+|------|------|------|------|
+| `id` | string | ✅ | 数据标识，仅允许 `[A-Za-z0-9_-]{1,64}` |
+| `contract_price_clause` | string | ✅ | 合同总价条款原文 |
+| `contract_price_clause_context` | string/null | ❌ | 合同总价条款上下文文本，可为 `null` 或空串 |
+| `sis_contract_price` | float | ✅ | SIS 系统记录的合同金额（单位：元） |
+
+#### 请求示例
+
+```bash
+curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/compare_contract_price \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer 7d9b2e17-2290d95b9773-2e862b5cee2c" \
+  -d '{
+    "id": "price-001",
+    "contract_price_clause": "合同总价款人民币壹拾贰万元整（￥120000元）",
+    "contract_price_clause_context": "第三条 合同总价\n3.1 合同总价款人民币壹拾贰万元整（￥120000元）。",
+    "sis_contract_price": 120000
+  }'
+```
+
+#### 响应
+
+##### 成功响应 (200 OK)
+
+```json
+{
+  "id": "price-001",
+  "contract_price_clause": "合同总价款人民币壹拾贰万元整（￥120000元）",
+  "contract_price_clause_context": "第三条 合同总价\n3.1 合同总价款人民币壹拾贰万元整（￥120000元）。",
+  "sis_contract_price": 120000.0,
+  "contract_price": 120000.0,
+  "comparison_result": true
+}
+```
+
+##### 响应字段说明
+
+| 字段 | 类型 | 描述 |
+|------|------|------|
+| `id` | string | 原样回带请求 ID |
+| `contract_price_clause` | string | 原样回带请求条款文本 |
+| `contract_price_clause_context` | string/null | 原样回带请求上下文 |
+| `sis_contract_price` | float | 原样回带 SIS 金额 |
+| `contract_price` | float/null | LLM 提取出的合同总金额；条款无金额或解析失败时为 `null` |
+| `comparison_result` | boolean | 是否一致：`abs(contract_price - sis_contract_price) ≤ 10.0` 时为 `true`；`contract_price` 为 `null` 时一律为 `false` |
+
+##### 错误响应
+
+- **422 Unprocessable Entity**：请求字段缺失/类型错误（如 `id` 含非法字符、`sis_contract_price` 非数值）。
+- **504 Gateway Timeout**：LLM 调用超时（受 `REQUEST_TIMEOUT_SEC` 约束，默认 300s）。
+- **500 Internal Server Error**：LLM/服务内部异常，返回 `trace_id` 便于排查。
+
+> **注意**：比对阈值 `10.0` 为硬编码常量，位于 `app/utils/contract_price_comparator.py` 中的 `_PRICE_DIFF_TOLERANCE`，**不读取环境变量、不接受配置覆盖**。
 
 ---
 
@@ -643,7 +715,7 @@ response = requests.post(
         "id": "eval-001",
         "operation_type": "analyze",
         "paragraphs": paragraphs,
-        "gt_payment_stages": ground_truth
+        "sis_payment_stages": ground_truth
     },
     headers=headers,
     timeout=600
@@ -750,7 +822,7 @@ for result in results:
 
 ```python
 # 正确示例
-gt_payment_stages = [
+sis_payment_stages = [
     {
         "stage": "预付款",
         "ratio": "30%",        # 等价于 0.3
@@ -866,6 +938,8 @@ F1 = 2 × (精确率 × 召回率) / (精确率 + 召回率)
 
 | 版本 | 日期 | 变更说明 |
 |------|------|----------|
+| **v1.8.1** | 2026-06 | **Breaking**: `analyze` 模式请求字段 `gt_payment_stages` 重命名为 `sis_payment_stages`；422 错误信息中的 `loc` 同步更新；其余字段语义、归一化规则与响应结构保持不变。客户端需同步替换字段名，旧字段不再兼容。 |
+| **v1.8.0** | 2026-06 | 新增 `POST /compare_contract_price` 接口：基于 LLM 从合同总价条款抽取金额（提示词 `CONTRACT_PRICE_EXTRACTION_PROMPT` 位于 `app/config/prompts.py`），与 `sis_contract_price` 做硬编码差值比对（阈值固定 `10.0` 元）。新增 Service 层 `app/utils/contract_price_comparator.py`；DTO `ContractPriceCompareRequest` / `ContractPriceCompareResponse` 定义于 `app/api.py`。 |
 | **v1.7.1** | 2026-06 | `analyze` 模式的 `correct_payments` / `missed_payments` / `false_payments` 现统一应用标准节点映射（`payment_type` 输出映射后名称），新增 `payment_code`、`payment_days`、`latest_payment_stage`、`latest_payment_date`、`special_clause_content` 字段（后 4 个为占位，当前返回 `null`），与 `extraction_result` 中 `PaymentItem` 输出字段保持一致。 |
 | **v1.7.0** | 2026-06 | 节点输出标准化：`PaymentItem.payment_type` 现统一返回**标准节点名称**（如内部 `"销售定金"` → 输出 `"合同定金"`，`"进场前（首付）"` → `"进场前"`），并新增 `payment_code` 字段携带节点编码（如 `EARNEST`、`Z023`）。映射表来自《节点映射.xlsx》并同步至业务词典 `equipment.payment_type_mapping` / `install.payment_type_mapping`，按 `clause_category` 路由查表，未命中时 `payment_type` 回退原名、`payment_code` 为 `null`。本次仅调整 API 输出层，内部 LangGraph 状态、去重、跨类映射、比对均保持原逻辑。 |
 | **v1.6.1** | 2026-06 | `PaymentItem` 新增 4 个占位字段：`payment_days`（付款天数）、`latest_payment_stage`（最迟付款节点）、`latest_payment_date`（最迟付款时间）、`special_clause_content`（特殊条款内容）。当前版本统一返回 `null`，提取逻辑将由后续迭代补充。响应序列化由 `exclude_none=True` 调整为 `exclude_none=False`，以便上述新字段以 `null` 形式显式出现。 |

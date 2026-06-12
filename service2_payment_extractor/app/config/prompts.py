@@ -778,6 +778,34 @@ PAYMENT_TIMING_EXTRACTION_PROMPT = """# 任务
 
 
 
+# =============================================================================
+# 合同总金额提取（用于 /compare_contract_price 接口）
+# =============================================================================
+# 单大括号占位符，调用方使用 str.format() 注入：
+#   - {contract_price_clause}         合同总价条款原文（必填）
+#   - {contract_price_clause_context} 条款上下文（可空，调用方传入空串即可）
+CONTRACT_PRICE_EXTRACTION_PROMPT = """你是合同金额抽取专家。请从下方"合同总价条款"中精确抽取**合同总金额**（单位：元，人民币）。
+
+## 抽取规则
+1. 仅返回一个数值；优先采用阿拉伯数字金额，若仅有大写中文金额则换算为阿拉伯数字。
+2. 单位换算：「万元」乘以 10000，「亿元」乘以 100000000；带「元/RMB/￥/¥/人民币」前后缀的统一去除。
+3. 含税总价 / 合同总金额 / 合同总价款 / 价款总额 优先于分项金额。
+4. 若条款中只有比例、单价或分项金额（无法得到合同总金额）→ 返回 null。
+5. 严禁推理、估算或借助上下文之外的信息；上下文仅辅助理解条款，不得引用其中的数字推断总价。
+
+## 输出格式（必须严格遵守）
+只输出一行 JSON，禁止 markdown、禁止解释文字：
+{{"contract_price": <number|null>}}
+
+## 输入
+合同总价条款：
+{contract_price_clause}
+
+条款上下文（可能为空）：
+{contract_price_clause_context}
+"""
+
+
 __all__ = [
     "PAYMENT_RATIO_PROMPT",
     "EQUIPMENT_PAYMENT_RATIO_PROMPT",
@@ -790,4 +818,5 @@ __all__ = [
     "PAYMENT_CLAUSE_VALIDATION_PROMPT",
     "PAYMENT_CLAUSE_CATEGORY_PROMPT",
     "PAYMENT_TIMING_EXTRACTION_PROMPT",
+    "CONTRACT_PRICE_EXTRACTION_PROMPT",
 ]

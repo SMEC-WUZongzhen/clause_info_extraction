@@ -27,6 +27,9 @@ let lastWarrantyItems = []; // 缓存最近一次 Step 2 的质保期条款
 let lastStep2Result = null; // 完整 Step 2 结果（供历史保存）
 let lastStep1Payload = null; // 完整 Step 1 payload（供历史保存）
 let lastTaskId = "";       // 最近一次任务 ID（用于重跑 Step 2）
+let lastOperationType = "extract"; // 最近一次操作模式
+let lastGtPaymentStages = null;    // 最近一次真值数据（analyze 模式）
+let currentHistoryTab = "extract"; // 历史记录当前 Tab
 
 // ===== 耗时统计 =====
 const timers = {
@@ -382,6 +385,10 @@ function findContextByClause(clauseText) {
 function renderStep2(result) {
   els.step2Card.hidden = false;
 
+  // 默认隐藏对比结果区域（由 renderCompareResult 按需显示）
+  const compareSection = document.getElementById("compare-result-section");
+  if (compareSection) compareSection.hidden = true;
+
   const msg = result.message || "success";
   const elapsed = result._elapsed_seconds;
   els.step2Meta.innerHTML = `
@@ -515,6 +522,10 @@ function startProcess(sessionId) {
       timers.step2Elapsed = payload._elapsed_seconds;
     }
     renderStep2(payload);
+    // 若包含对比数据则渲染对比结果
+    if (payload.correct_payments || payload.missed_payments || payload.false_payments) {
+      renderCompareResult(payload);
+    }
     markStageDone("step2");
     updateTimerDisplay();
     // 自动滚动到 Step 2 卡片，提升查找便利性
@@ -548,6 +559,186 @@ function startProcess(sessionId) {
       stopTimerTicker();
     }
   };
+}
+
+// ===== 操作模式切换 & GT 真值输入 =====
+document.querySelectorAll('input[name="operation_type"]').forEach((radio) => {
+  radio.addEventListener("change", (e) => {
+    const gtSection = document.getElementById("gt-section");
+    if (gtSection) gtSection.hidden = e.target.value !== "analyze";
+  });
+});
+
+function addGTRow(stage = "", category = "equipment_payment", ratio = "", amount = "") {
+  const tbody = document.querySelector("#gt-table tbody");
+  if (!tbody) return;
+  const tr = document.createElement("tr");
+  tr.innerHTML = `
+    <td><input type="text" class="gt-stage" value="${esc(stage)}" placeholder="如: 预付款" /></td>
+    <td>
+      <select class="gt-category">
+        <option value="equipment_payment"${category === "equipment_payment" ? " selected" : ""}>设备付款</option>
+        <option value="installation_payment"${category === "installation_payment" ? " selected" : ""}>安装付款</option>
+      </select>
+    </td>
+    <td><input type="text" class="gt-ratio" value="${esc(ratio)}" placeholder="如: 30 或 30%" /></td>
+    <td><input type="text" class="gt-amount" value="${esc(amount)}" placeholder="如: 50000" /></td>
+    <td><button type="button" class="gt-del-btn copy-btn" style="padding:2px 8px;font-size:11px;">删除</button></td>
+  `;
+  tr.querySelector(".gt-del-btn").addEventListener("click", () => tr.remove());
+  tbody.appendChild(tr);
+}
+
+document.getElementById("gt-add-row-btn")?.addEventListener("click", () => addGTRow());
+
+function collectGTData() {
+  const rows = document.querySelectorAll("#gt-table tbody tr");
+  const stages = [];
+  rows.forEach((tr) => {
+    const stage = tr.querySelector(".gt-stage")?.value.trim();
+    const category = tr.querySelector(".gt-category")?.value || "equipment_payment";
+    const ratio = tr.querySelector(".gt-ratio")?.value.trim();
+    const amount = tr.querySelector(".gt-amount")?.value.trim();
+    if (!stage) return; // 跳过空行
+    const item = { stage, category };
+    if (ratio) item.ratio = ratio;
+    if (amount) item.stage_amount = amount;
+    if (ratio || amount) stages.push(item);
+  });
+  return stages.length ? stages : null;
+}
+
+// ===== 对比结果渲染 =====
+function renderCompareResult(result) {
+  const section = document.getElementById("compare-result-section");
+  if (!section) return;
+
+  // 判断是否包含对比数据
+  const hasCompare = result.correct_payments || result.missed_payments ||
+                     result.false_payments || result.evaluation_metrics;
+  if (!hasCompare) {
+    section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+
+  // 评估指标
+  const metricsEl = document.getElementById("eval-metrics");
+  const metrics = result.evaluation_metrics || {};
+  if (metricsEl) {
+    metricsEl.innerHTML = `
+      <div class="metric-card"><div class="metric-label">Precision</div><div class="metric-value">${((metrics.precision || 0) * 100).toFixed(1)}%</div></div>
+      <div class="metric-card"><div class="metric-label">Recall</div><div class="metric-value">${((metrics.recall || 0) * 100).toFixed(1)}%</div></div>
+      <div class="metric-card"><div class="metric-label">F1 Score</div><div class="metric-value">${((metrics.f1_score || 0) * 100).toFixed(1)}%</div></div>
+      <div class="metric-card"><div class="metric-label">Accuracy</div><div class="metric-value">${((metrics.accuracy || 0) * 100).toFixed(1)}%</div></div>
+    `;
+  }
+
+  // 辅助函数
+  const categoryLabel = (cat) => {
+    if (cat === "equipment_payment") return "设备";
+    if (cat === "installation_payment") return "安装";
+    return "-";
+  };
+  // 从提取结果构建 payment_type → clause_category 映射
+  const catLookup = {};
+  const extraction = (lastStep2Result && lastStep2Result.extraction_result) || [];
+  extraction.forEach((it) => {
+    if (it.payment_type && it.clause_category) {
+      catLookup[it.payment_type] = it.clause_category;
+    }
+  });
+  // 从 GT 数据构建 stage → category 映射（用于漏提取项）
+  const gtCatLookup = {};
+  (lastGtPaymentStages || []).forEach((gt) => {
+    if (gt.stage && gt.category) {
+      gtCatLookup[gt.stage] = gt.category;
+    }
+  });
+  // payment_code 兜底映射（设备独有 / 安装独有节点）
+  const _EQ_ONLY = new Set(["EARNEST","DEPOSIT","WITHDRAWAL","Z001","Z002","Z021","Z022"]);
+  const _INST_ONLY = new Set(["Z018","DOWNPAYMENT","Z027","Z028","Z019"]);
+  const codeToCat = (code) => {
+    if (!code) return "";
+    if (_EQ_ONLY.has(code)) return "equipment_payment";
+    if (_INST_ONLY.has(code)) return "installation_payment";
+    return "";
+  };
+  // 综合解析节点类型
+  // isExtracted: 提取结果自带 clause_category，应直接使用；catLookup 仅兜底给漏提取项
+  const resolveCategory = (it, isExtracted) => {
+    if (isExtracted && it.clause_category) return it.clause_category;
+    return it.clause_category || catLookup[it.payment_type] || gtCatLookup[it.payment_type] || codeToCat(it.payment_code) || "";
+  };
+
+  // 构建正确匹配集合 (payment_type + "|" + payment_ratio)
+  const correctSet = new Set();
+  (result.correct_payments || []).forEach((cp) => {
+    correctSet.add((cp.payment_type || "") + "|" + (cp.payment_ratio ?? ""));
+  });
+
+  // 提取结果：每条标注 ✔ 或 ✗
+  const extractedItems = extraction
+    .filter((it) => it.payment_type)
+    .map((it) => {
+      const key = (it.payment_type || "") + "|" + (it.payment_ratio ?? "");
+      return { ...it, _correct: correctSet.has(key) };
+    });
+
+  // 漏提取项
+  const missedItems = (result.missed_payments || []);
+
+  // 渲染合并表
+  const tbody = document.querySelector("#merged-compare-table tbody");
+  if (!tbody) return;
+
+  const rows = [];
+  let idx = 0;
+
+  // 提取结果行
+  extractedItems.forEach((it) => {
+    idx++;
+    const cat = resolveCategory(it, true);
+    const statusHtml = it._correct
+      ? `<span class="compare-status status-correct">✔</span>`
+      : `<span class="compare-status status-false">✗</span>`;
+    rows.push(`
+      <tr class="${it._correct ? 'row-correct' : 'row-false'}">
+        <td class="idx">${idx}</td>
+        <td style="text-align:center;">${statusHtml}</td>
+        <td><span class="tag${cat === 'installation_payment' ? ' warranty' : ''}">${esc(categoryLabel(cat))}</span></td>
+        <td>${esc(it.payment_type || "-")}</td>
+        <td>${esc(it.payment_code ?? "-")}</td>
+        <td>${esc(it.payment_ratio ?? "-")}</td>
+        <td>${esc(it.payment_amount ?? "-")}</td>
+      </tr>`);
+  });
+
+  // 漏提取行（分隔行 + 数据行）
+  if (missedItems.length) {
+    rows.push(`
+      <tr class="row-missed-header">
+        <td colspan="7">漏提取 (${missedItems.length})</td>
+      </tr>`);
+    missedItems.forEach((it) => {
+      idx++;
+      const cat = resolveCategory(it, false);
+      rows.push(`
+        <tr class="row-missed">
+          <td class="idx">${idx}</td>
+          <td style="text-align:center;"><span class="compare-status status-missed">✗</span></td>
+          <td><span class="tag${cat === 'installation_payment' ? ' warranty' : ''}">${esc(categoryLabel(cat))}</span></td>
+          <td>${esc(it.payment_type || "-")}</td>
+          <td>${esc(it.payment_code ?? "-")}</td>
+          <td>${esc(it.payment_ratio ?? "-")}</td>
+          <td>${esc(it.payment_amount ?? "-")}</td>
+        </tr>`);
+    });
+  }
+
+  tbody.innerHTML = rows.length
+    ? rows.join("")
+    : `<tr><td colspan="7" style="text-align:center;color:#9ca3af">无</td></tr>`;
 }
 
 // ===== 表单提交 =====
@@ -584,6 +775,20 @@ els.form.addEventListener("submit", async (e) => {
   }
   if (taskIdInput && taskIdInput.value.trim() !== "") {
     fd.append("task_id", taskIdInput.value.trim());
+  }
+
+  // 操作模式
+  const opTypeRadio = els.form.querySelector('input[name="operation_type"]:checked');
+  const opType = opTypeRadio ? opTypeRadio.value : "extract";
+  lastOperationType = opType;
+  fd.append("operation_type", opType);
+  if (opType === "analyze") {
+    const gtData = collectGTData();
+    if (!gtData) { alert("对比模式下请至少输入一条真值数据"); els.submitBtn.disabled = false; return; }
+    lastGtPaymentStages = gtData;
+    fd.append("gt_json", JSON.stringify(gtData));
+  } else {
+    lastGtPaymentStages = null;
   }
 
   try {
@@ -708,14 +913,26 @@ document.getElementById("rerun-step2-btn")?.addEventListener("click", async (e) 
   const taskIdInput = document.getElementById("task_id");
   const taskId = (taskIdInput && taskIdInput.value.trim()) || "";
 
+  // 读取操作模式和真值数据
+  const opTypeRadio = document.querySelector('input[name="operation_type"]:checked');
+  const rerunOpType = opTypeRadio ? opTypeRadio.value : "extract";
+  lastOperationType = rerunOpType;
+  const rerunBody = { paragraphs: step1Paragraphs, task_id: taskId, operation_type: rerunOpType };
+  if (rerunOpType === "analyze") {
+    const gtData = collectGTData();
+    if (gtData) {
+      lastGtPaymentStages = gtData;
+      rerunBody.sis_payment_stages = gtData;
+    }
+  } else {
+    lastGtPaymentStages = null;
+  }
+
   try {
     const resp = await fetch("/api/rerun-step2", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        paragraphs: step1Paragraphs,
-        task_id: taskId,
-      }),
+      body: JSON.stringify(rerunBody),
     });
     const data = await resp.json();
     if (!resp.ok) {
@@ -724,6 +941,10 @@ document.getElementById("rerun-step2-btn")?.addEventListener("click", async (e) 
     }
     // 渲染新 Step 2 结果
     renderStep2(data.result || {});
+    // 若包含对比数据则渲染对比结果
+    if (data.result && (data.result.correct_payments || data.result.missed_payments || data.result.false_payments)) {
+      renderCompareResult(data.result);
+    }
     els.step2Card.hidden = false;
     els.step2Card.scrollIntoView({ behavior: "smooth", block: "start" });
     // 重跑 Step 2 成功后自动保存到历史记录
@@ -778,6 +999,14 @@ async function saveToHistory() {
     ratioSummary: ratioSummary || "-",
     amountSummary: amountSummary || "-",
     step2Elapsed: (lastStep2Result && lastStep2Result._elapsed_seconds) || null,
+    operationType: lastOperationType || "extract",
+    gtData: (lastOperationType === "analyze") ? lastGtPaymentStages : null,
+    compareData: (lastOperationType === "analyze" && lastStep2Result) ? {
+      correct_payments: lastStep2Result.correct_payments,
+      missed_payments: lastStep2Result.missed_payments,
+      false_payments: lastStep2Result.false_payments,
+      evaluation_metrics: lastStep2Result.evaluation_metrics,
+    } : null,
     paymentItems: payItems,
     warrantyItems: extraction.filter((r) => r.warranty != null),
     step1Data: s1,
@@ -802,7 +1031,7 @@ async function renderHistory() {
 
   let list = [];
   try {
-    const resp = await fetch("/api/history");
+    const resp = await fetch(`/api/history?type=${encodeURIComponent(currentHistoryTab)}`);
     if (resp.ok) list = await resp.json();
   } catch (_) {}
 
@@ -814,6 +1043,8 @@ async function renderHistory() {
 
   if (!list.length) {
     tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:#9ca3af">暂无历史记录</td></tr>`;
+    // 仍然更新 Tab 计数
+    updateTabCounts();
     return;
   }
 
@@ -857,6 +1088,25 @@ async function renderHistory() {
   tbody.querySelectorAll(".hist-check").forEach((cb) => {
     cb.addEventListener("change", updateBatchBtnState);
   });
+
+  // 更新 Tab 计数
+  updateTabCounts();
+}
+
+// 更新 Tab 标签上的记录数
+async function updateTabCounts() {
+  const tabs = document.querySelectorAll(".tab-btn");
+  for (const btn of tabs) {
+    const tab = btn.dataset.tab;
+    try {
+      const resp = await fetch(`/api/history?type=${encodeURIComponent(tab)}`);
+      if (resp.ok) {
+        const list = await resp.json();
+        const baseLabel = tab === "extract" ? "提取" : "对比";
+        btn.textContent = `${baseLabel}（${list.length}）`;
+      }
+    } catch (_) {}
+  }
 }
 
 function updateBatchBtnState() {
@@ -899,6 +1149,11 @@ async function viewHistory(id) {
   if (record.step2Data) {
     renderStep2(record.step2Data);
     lastStep2Result = record.step2Data;
+    // 若是对比模式记录，恢复 GT 数据并渲染对比结果
+    if (record.compareData) {
+      lastGtPaymentStages = record.gtData || null;
+      renderCompareResult(record.compareData);
+    }
   } else {
     els.step2Card.hidden = true;
   }
@@ -914,13 +1169,24 @@ async function deleteHistory(id) {
   await renderHistory();
 }
 
-// 清空全部
+// 清空全部（仅清空当前 Tab 类型）
 document.getElementById("clear-history-btn")?.addEventListener("click", async () => {
-  if (!confirm("确定清空全部历史记录？")) return;
+  if (!confirm(`确定清空「${currentHistoryTab === "extract" ? "提取" : "对比"}」全部历史记录？`)) return;
   try {
-    await fetch("/api/history", { method: "DELETE" });
+    await fetch(`/api/history?type=${encodeURIComponent(currentHistoryTab)}`, { method: "DELETE" });
   } catch (_) {}
   await renderHistory();
+});
+
+// 历史记录 Tab 切换
+document.querySelectorAll(".tab-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    if (btn.dataset.tab === currentHistoryTab) return;
+    currentHistoryTab = btn.dataset.tab;
+    document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    renderHistory();
+  });
 });
 
 // 全选/取消全选
@@ -970,8 +1236,27 @@ async function batchExportHistory() {
 
 document.getElementById("batch-export-history-btn")?.addEventListener("click", batchExportHistory);
 
-// 页面加载时渲染历史
-renderHistory();
+// 页面加载时：获取各 Tab 计数，自动切换到有记录的 Tab，然后渲染
+(async () => {
+  // 先获取两种类型的记录数
+  let extractCount = 0, analyzeCount = 0;
+  try {
+    const [extResp, anaResp] = await Promise.all([
+      fetch("/api/history?type=extract"),
+      fetch("/api/history?type=analyze"),
+    ]);
+    if (extResp.ok) extractCount = (await extResp.json()).length;
+    if (anaResp.ok) analyzeCount = (await anaResp.json()).length;
+  } catch (_) {}
+  // 如果默认 Tab 无记录但另一个有记录，自动切换
+  if (extractCount === 0 && analyzeCount > 0) {
+    currentHistoryTab = "analyze";
+    document.querySelectorAll(".tab-btn").forEach((b) => {
+      b.classList.toggle("active", b.dataset.tab === "analyze");
+    });
+  }
+  await renderHistory();
+})();
 
 // ===== Excel 导出 =====
 const PAYMENT_EXPORT_FIELDS = [

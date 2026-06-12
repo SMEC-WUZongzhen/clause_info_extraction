@@ -4,6 +4,7 @@
 - WAL 模式提升并发性能
 - 列表接口仅返回摘要（不含大 JSON 字段）
 - get_record / get_records_by_ids 返回完整数据
+- 支持 operation_type 分类：extract / analyze
 """
 from __future__ import annotations
 
@@ -30,7 +31,10 @@ CREATE TABLE IF NOT EXISTS history (
     step1_data         TEXT DEFAULT '',
     step2_data         TEXT DEFAULT '',
     payment_items      TEXT DEFAULT '[]',
-    warranty_items     TEXT DEFAULT '[]'
+    warranty_items     TEXT DEFAULT '[]',
+    operation_type     TEXT DEFAULT 'extract',
+    gt_data            TEXT DEFAULT '',
+    compare_data       TEXT DEFAULT ''
 );
 """
 
@@ -43,10 +47,20 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """建表（如不存在），启动时调用一次。"""
+    """建表（如不存在），并兼容旧数据库添加新列。"""
     conn = _connect()
     try:
         conn.execute(_CREATE_TABLE_SQL)
+        # 兼容旧数据库：尝试添加新列（若已存在则忽略错误）
+        for col_sql in (
+            "ALTER TABLE history ADD COLUMN operation_type TEXT DEFAULT 'extract'",
+            "ALTER TABLE history ADD COLUMN gt_data TEXT DEFAULT ''",
+            "ALTER TABLE history ADD COLUMN compare_data TEXT DEFAULT ''",
+        ):
+            try:
+                conn.execute(col_sql)
+            except sqlite3.OperationalError:
+                pass  # 列已存在
         conn.commit()
     finally:
         conn.close()
@@ -55,7 +69,7 @@ def init_db() -> None:
 # ---------- 摘要字段列表（list_records 使用） ----------
 _SUMMARY_COLS = (
     "id, created_at, filename, contract_type, contract_type_label, "
-    "type_summary, ratio_summary, amount_summary, step2_elapsed"
+    "type_summary, ratio_summary, amount_summary, step2_elapsed, operation_type"
 )
 
 
@@ -70,6 +84,7 @@ def _row_to_summary(row: sqlite3.Row) -> Dict[str, Any]:
         "ratioSummary": row["ratio_summary"],
         "amountSummary": row["amount_summary"],
         "step2Elapsed": row["step2_elapsed"],
+        "operationType": row["operation_type"],
     }
 
 
@@ -79,18 +94,31 @@ def _row_to_full(row: sqlite3.Row) -> Dict[str, Any]:
     d["step2Data"] = json.loads(row["step2_data"]) if row["step2_data"] else None
     d["paymentItems"] = json.loads(row["payment_items"]) if row["payment_items"] else []
     d["warrantyItems"] = json.loads(row["warranty_items"]) if row["warranty_items"] else []
+    d["gtData"] = json.loads(row["gt_data"]) if row["gt_data"] else None
+    d["compareData"] = json.loads(row["compare_data"]) if row["compare_data"] else None
     return d
 
 
 # ---------- CRUD ----------
 
-def list_records() -> List[Dict[str, Any]]:
-    """返回所有记录摘要（按 created_at 倒序）。"""
+def list_records(operation_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    """返回记录摘要（按 created_at 倒序）。
+
+    Args:
+        operation_type: 过滤操作类型，None 则返回全部
+    """
     conn = _connect()
     try:
-        rows = conn.execute(
-            f"SELECT {_SUMMARY_COLS} FROM history ORDER BY created_at DESC"
-        ).fetchall()
+        if operation_type:
+            rows = conn.execute(
+                f"SELECT {_SUMMARY_COLS} FROM history "
+                "WHERE operation_type = ? ORDER BY created_at DESC",
+                (operation_type,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT {_SUMMARY_COLS} FROM history ORDER BY created_at DESC"
+            ).fetchall()
         return [_row_to_summary(r) for r in rows]
     finally:
         conn.close()
@@ -133,8 +161,9 @@ def create_record(data: Dict[str, Any]) -> None:
             """INSERT OR REPLACE INTO history
                (id, created_at, filename, contract_type, contract_type_label,
                 type_summary, ratio_summary, amount_summary, step2_elapsed,
-                step1_data, step2_data, payment_items, warranty_items)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                step1_data, step2_data, payment_items, warranty_items,
+                operation_type, gt_data, compare_data)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 data.get("id", ""),
                 data.get("createdAt", ""),
@@ -149,6 +178,9 @@ def create_record(data: Dict[str, Any]) -> None:
                 json.dumps(data.get("step2Data"), ensure_ascii=False) or "",
                 json.dumps(data.get("paymentItems", []), ensure_ascii=False),
                 json.dumps(data.get("warrantyItems", []), ensure_ascii=False),
+                data.get("operationType", "extract"),
+                json.dumps(data.get("gtData"), ensure_ascii=False) or "",
+                json.dumps(data.get("compareData"), ensure_ascii=False) or "",
             ),
         )
         conn.commit()
@@ -176,11 +208,21 @@ def delete_record(record_id: str) -> bool:
         conn.close()
 
 
-def delete_all() -> int:
-    """清空全部记录，返回删除行数。"""
+def delete_all(operation_type: Optional[str] = None) -> int:
+    """清空记录，返回删除行数。
+
+    Args:
+        operation_type: 仅清空指定类型，None 则清空全部
+    """
     conn = _connect()
     try:
-        cur = conn.execute("DELETE FROM history")
+        if operation_type:
+            cur = conn.execute(
+                "DELETE FROM history WHERE operation_type = ?",
+                (operation_type,),
+            )
+        else:
+            cur = conn.execute("DELETE FROM history")
         conn.commit()
         return cur.rowcount
     finally:

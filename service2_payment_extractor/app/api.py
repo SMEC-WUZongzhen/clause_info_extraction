@@ -28,6 +28,10 @@ from app.config.config import (
 from app.states.states import Paragraph
 from app.utils.comparison_helper import ComparisonHelper, PaymentStage, ComparisonItem, EvaluationMetrics
 from app.utils.payment_ratio_extractor import get_summary_extractor
+from app.utils.contract_price_comparator import (
+    extract_contract_price,
+    compare_contract_price,
+)
 from app.utils.observability import setup_observability
 from app.utils.token_counter import count_tokens, warmup as token_counter_warmup
 from app.config.business_dict import get_business_dict, get_payment_type_mapping, assert_consistency_with_prompts
@@ -196,7 +200,7 @@ class ExtractPaymentInfoRequest(BaseModel):
         description="Service 1 输出的段落列表",
         max_length=_MAX_PARAGRAPHS,
     )
-    gt_payment_stages: Optional[List[GroundTruthItem]] = Field(
+    sis_payment_stages: Optional[List[GroundTruthItem]] = Field(
         None, description="基准数据列表（operation_type='analyze' 时需要）"
     )
     operation_type: Literal["extract", "analyze"] = Field(
@@ -212,8 +216,8 @@ class ExtractPaymentInfoRequest(BaseModel):
 
     @model_validator(mode='after')
     def validate_inputs(self) -> 'ExtractPaymentInfoRequest':
-        if self.operation_type == "analyze" and not self.gt_payment_stages:
-            raise ValueError("'analyze' 操作必须提供 'gt_payment_stages'。")
+        if self.operation_type == "analyze" and not self.sis_payment_stages:
+            raise ValueError("'analyze' 操作必须提供 'sis_payment_stages'。")
         return self
 
 
@@ -395,7 +399,7 @@ async def extract_payment_info(
     - 设备/安装付款节点（节点名称、比例、金额）
     - 质保期信息
 
-    当 `operation_type='analyze'` 时，额外与 `gt_payment_stages` 进行比对，返回准确率指标。
+    当 `operation_type='analyze'` 时，额外与 `sis_payment_stages` 进行比对，返回准确率指标。
     """
     logger.info(f"--- 接收到 /extract_payment_info 请求，ID: {request.id}, 模式: {request.operation_type} ---")
 
@@ -415,7 +419,7 @@ async def extract_payment_info(
 
     # 构建基准数据（analyze 模式）
     ground_truth_data = None
-    if request.operation_type == "analyze" and request.gt_payment_stages:
+    if request.operation_type == "analyze" and request.sis_payment_stages:
         ground_truth_data = [
             {
                 "付款节点": item.stage,
@@ -423,7 +427,7 @@ async def extract_payment_info(
                 "金额": item.stage_amount,
                 "category": item.category,
             }
-            for item in request.gt_payment_stages
+            for item in request.sis_payment_stages
         ]
 
     # 构建初始 State 直接注入
@@ -606,11 +610,11 @@ def _iter_balanced_json_blocks(text: str):
 def extract_paragraphs_from_messages(messages: List[Message]) -> tuple[List[Dict[str, Any]], Optional[str], Optional[List[Dict[str, Any]]]]:
     """从 OpenAI messages 中解析 paragraphs 和操作类型。
 
-    返回: (paragraphs, operation_type, gt_payment_stages)
+    返回: (paragraphs, operation_type, sis_payment_stages)
     """
     paragraphs: List[Dict[str, Any]] = []
     operation_type = "extract"
-    gt_payment_stages: Optional[List[Dict[str, Any]]] = None
+    sis_payment_stages: Optional[List[Dict[str, Any]]] = None
 
     for msg in messages:
         content = msg.content or ""
@@ -640,11 +644,11 @@ def extract_paragraphs_from_messages(messages: List[Message]) -> tuple[List[Dict
                     paragraphs.append(data)
 
         # 3) 文本格式 GT
-        if "## 参考标准答案" in content or "Ground Truth" in content or "gt_payment_stages" in content.lower():
+        if "## 参考标准答案" in content or "Ground Truth" in content or "sis_payment_stages" in content.lower():
             gt_pattern = r"\d+\.\s*([^:]+):\s*([^,\n]+)"
             gt_matches = re.findall(gt_pattern, content)
             if gt_matches:
-                gt_payment_stages = []
+                sis_payment_stages = []
                 for stage, amount in gt_matches:
                     gt_item: Dict[str, Any] = {
                         "stage": stage.strip(),
@@ -656,10 +660,10 @@ def extract_paragraphs_from_messages(messages: List[Message]) -> tuple[List[Dict
                     if ratio_match:
                         ratio_val = float(ratio_match.group(1))
                         gt_item["ratio"] = ratio_val / 100 if ratio_val > 1 else ratio_val
-                    gt_payment_stages.append(gt_item)
+                    sis_payment_stages.append(gt_item)
                 operation_type = "analyze"
 
-    return paragraphs, operation_type, gt_payment_stages
+    return paragraphs, operation_type, sis_payment_stages
 
 
 def build_payment_extraction_prompt(paragraphs: List[Dict[str, Any]], operation_type: str = "extract") -> str:
@@ -715,7 +719,7 @@ async def chat_completions(request: OpenAIChatRequest):
         combined_content = "\n\n".join(all_content)
 
         # 尝试解析 paragraphs
-        paragraphs, operation_type, gt_payment_stages = extract_paragraphs_from_messages(request.messages)
+        paragraphs, operation_type, sis_payment_stages = extract_paragraphs_from_messages(request.messages)
 
         # 如果没有解析到 paragraphs，再用栈式扫描尝试一次顶层 JSON 块
         if not paragraphs:
@@ -767,7 +771,7 @@ async def chat_completions(request: OpenAIChatRequest):
 
         # 构建 ground_truth_data
         ground_truth_data = None
-        if operation_type == "analyze" and gt_payment_stages:
+        if operation_type == "analyze" and sis_payment_stages:
             ground_truth_data = [
                 {
                     "付款节点": item.get("stage", ""),
@@ -775,7 +779,7 @@ async def chat_completions(request: OpenAIChatRequest):
                     "金额": item.get("stage_amount", ""),
                     "category": item.get("category", "equipment_payment"),
                 }
-                for item in gt_payment_stages
+                for item in sis_payment_stages
             ]
 
         # 构建初始状态
@@ -907,6 +911,96 @@ async def chat_completions(request: OpenAIChatRequest):
 
 # =============================================================================
 # 6. 健康检查
+# =============================================================================
+
+# =============================================================================
+# 5.x 合同总金额一致性比对接口
+# =============================================================================
+
+class ContractPriceCompareRequest(BaseModel):
+    """POST /compare_contract_price 请求模型"""
+    id: str = Field(..., description="数据标识（仅允许 [A-Za-z0-9_-]{1,64}）")
+    contract_price_clause: str = Field(
+        ..., min_length=1, max_length=_MAX_CLAUSE_LEN,
+        description="合同总价条款文本",
+    )
+    contract_price_clause_context: Optional[str] = Field(
+        None, max_length=_MAX_CLAUSE_LEN * 4,
+        description="合同总价条款上下文文本（可空）",
+    )
+    sis_contract_price: float = Field(..., description="SIS 系统记录的合同金额")
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, v: str) -> str:
+        if not _SAFE_ID_RE.match(v or ""):
+            raise ValueError("id 必须为 1-64 位且仅含 [A-Za-z0-9_-]")
+        return v
+
+
+class ContractPriceCompareResponse(BaseModel):
+    """POST /compare_contract_price 响应模型"""
+    id: str
+    contract_price_clause: str
+    contract_price_clause_context: Optional[str] = None
+    sis_contract_price: float
+    contract_price: Optional[float] = Field(None, description="LLM 提取的合同总金额")
+    comparison_result: bool = Field(..., description="是否一致：|差值| ≤ 10.0 → true")
+
+
+@app.post(
+    "/compare_contract_price",
+    tags=["合同金额比对"],
+    summary="LLM 提取合同总金额并与 SIS 金额比对",
+    response_model=ContractPriceCompareResponse,
+)
+async def compare_contract_price_endpoint(request: ContractPriceCompareRequest):
+    """LLM 抽取合同总金额，并与 `sis_contract_price` 做差值比对（阈值固定 10.0）。"""
+    logger.info(f"--- 接收到 /compare_contract_price 请求，ID: {request.id} ---")
+
+    try:
+        extracted = await asyncio.wait_for(
+            extract_contract_price(
+                request.contract_price_clause,
+                request.contract_price_clause_context,
+            ),
+            timeout=_REQUEST_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"合同金额抽取超时 (ID: {request.id})")
+        raise HTTPException(
+            status_code=504,
+            detail={"error": "Contract price extraction timeout", "timeout_sec": _REQUEST_TIMEOUT_SEC},
+        )
+    except Exception as e:  # noqa: BLE001
+        trace_id = uuid.uuid4().hex
+        logger.opt(exception=True).critical(
+            "合同金额抽取失败 trace_id={tid} req={rid}: {err}",
+            tid=trace_id, rid=request.id, err=str(e),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "Internal Server Error", "trace_id": trace_id},
+        )
+
+    is_match, diff = compare_contract_price(extracted, request.sis_contract_price)
+    logger.success(
+        f"任务 {request.id} 比对完成：extracted={extracted}, sis={request.sis_contract_price}, "
+        f"diff={diff}, match={is_match}"
+    )
+
+    return ContractPriceCompareResponse(
+        id=request.id,
+        contract_price_clause=request.contract_price_clause,
+        contract_price_clause_context=request.contract_price_clause_context,
+        sis_contract_price=request.sis_contract_price,
+        contract_price=extracted,
+        comparison_result=is_match,
+    )
+
+
+# =============================================================================
+# 7. 健康检查
 # =============================================================================
 
 @app.get("/health", tags=["运维"])

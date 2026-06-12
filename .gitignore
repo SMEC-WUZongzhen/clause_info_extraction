@@ -52,3 +52,4 @@ service2_payment_extractor/.sisyphus
 .sisyphus
 service1_clause_extractor
 payment_extractor_service_v2
+.qoder
