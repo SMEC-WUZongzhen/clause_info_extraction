@@ -12,9 +12,11 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional
@@ -22,6 +24,12 @@ from typing import Any, Callable, Dict, List, Optional
 import requests
 
 import config
+
+logger = logging.getLogger(__name__)
+
+
+class CancelledError(Exception):
+    """流水线被客户端取消时抛出的内部信号。"""
 
 
 # ===== 动态加载 clause_classify_client 模块 =====
@@ -64,7 +72,8 @@ class PipelineError(Exception):
 def _fetch_context_for_items(client: ClauseClassifierClient,
                               items: List[Dict[str, Any]],
                               full_doc_text: str,
-                              max_chars: int) -> None:
+                              max_chars: int,
+                              cancelled: Optional[threading.Event] = None) -> None:
     """为单个 chunk 的 filtered items 并发获取上下文，就地修改。
 
     注意：传入的是整份文档的全文（full_doc_text），而非当前 chunk，
@@ -74,6 +83,8 @@ def _fetch_context_for_items(client: ClauseClassifierClient,
         return
 
     def _one(item):
+        if cancelled is not None and cancelled.is_set():
+            return item
         text = item.get("text", "")
         try:
             ctx = client.get_context(text, full_doc_text, max_chars=max_chars)
@@ -96,8 +107,12 @@ def _process_single_chunk(client: ClauseClassifierClient,
                            chunk_idx: int,
                            total_chunks: int,
                            task_id: str,
-                           max_chars: int) -> Dict[str, Any]:
+                           max_chars: int,
+                           cancelled: Optional[threading.Event] = None) -> Dict[str, Any]:
     """单个 chunk：extract → filter → 并发 get_context（上下文基于整份文档）"""
+    if cancelled is not None and cancelled.is_set():
+        raise CancelledError()
+
     raw = client.extract(chunk_text, task_id=f"{task_id}-chunk{chunk_idx}",
                          llm_timeout=config.LLM_TIMEOUT)
     if raw.get("status") != "success":
@@ -121,7 +136,29 @@ def _process_single_chunk(client: ClauseClassifierClient,
                 continue
             items.append(it)
 
-    _fetch_context_for_items(client, items, full_doc_text, max_chars)
+    # 收集合同总价条款（raw class = contract_price）
+    contract_price_items: List[Dict[str, Any]] = []
+    seen_price_text: set = set()
+    for line in raw.get("lines", []):
+        classes = line.get("clause_class") or []
+        if config.CONTRACT_PRICE_RAW_CLASS not in classes:
+            continue
+        text = (line.get("text") or "").strip()
+        if not text or text in ("...", "    ...") or text in seen_price_text:
+            continue
+        seen_price_text.add(text)
+        contract_price_items.append({
+            "text": text,
+            "original_classes": list(classes),
+            "confidence": (line.get("metadata") or {}).get("confidence", 0.0),
+            "beacon_ids": line.get("beacon_ids") or [],
+        })
+
+    if cancelled is not None and cancelled.is_set():
+        raise CancelledError()
+
+    _fetch_context_for_items(client, items, full_doc_text, max_chars, cancelled=cancelled)
+    _fetch_context_for_items(client, contract_price_items, full_doc_text, max_chars, cancelled=cancelled)
 
     # 保留该 chunk 所有原始条款（含非目标类别），用于前端"全部展开"
     raw_lines: List[Dict[str, Any]] = []
@@ -142,6 +179,7 @@ def _process_single_chunk(client: ClauseClassifierClient,
         "total_chunks": total_chunks,
         "status": "success",
         "items_with_context": items,
+        "contract_price_items": contract_price_items,
         "raw_lines": raw_lines,
     }
 
@@ -149,7 +187,8 @@ def _process_single_chunk(client: ClauseClassifierClient,
 def run_step1(md_bytes: bytes, task_id: str,
               lines_per_chunk: Optional[int] = None,
               max_chars: Optional[int] = None,
-              on_progress: Optional[Callable[[int, int], None]] = None) -> Dict[str, Any]:
+              on_progress: Optional[Callable[[int, int], None]] = None,
+              cancelled: Optional[threading.Event] = None) -> Dict[str, Any]:
     """
     执行 Service 1 完整链路，返回：
         {
@@ -165,6 +204,7 @@ def run_step1(md_bytes: bytes, task_id: str,
     Args:
         lines_per_chunk: 每份行数阈值；None 则使用 config.LINES_PER_CHUNK
         max_chars: 上下文最大字符数；None 则使用 config.MAX_CONTEXT_CHARS
+        cancelled: 客户端断开时由调用方 set()，pipeline 会尽快抛出 CancelledError
     """
     effective_lines = int(lines_per_chunk) if lines_per_chunk else config.LINES_PER_CHUNK
     effective_max_chars = int(max_chars) if max_chars else config.MAX_CONTEXT_CHARS
@@ -194,7 +234,7 @@ def run_step1(md_bytes: bytes, task_id: str,
             pass
 
     if not chunks:
-        return {"paragraphs": [], "all_clauses": []}
+        return {"paragraphs": [], "all_clauses": [], "contract_price": None}
 
     # 整份文档文本：用于 Service 1 上下文查询，避免被分块截断
     # 使用 utf-8-sig 以兼容可能存在的 BOM；解析失败时回退为各 chunk 拼接
@@ -215,13 +255,17 @@ def run_step1(md_bytes: bytes, task_id: str,
     with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as ex:
         future_map = {
             ex.submit(_process_single_chunk, client, chunk, full_doc_text, idx,
-                      total_chunks, task_id, effective_max_chars): idx
+                      total_chunks, task_id, effective_max_chars, cancelled): idx
             for idx, chunk in enumerate(chunks, 1)
         }
         for fut in as_completed(future_map):
             idx = future_map[fut]
             try:
                 chunk_results.append(fut.result())
+            except CancelledError:
+                # 客户端已断开，停止收集后续结果
+                logger.info("run_step1 cancelled by client at chunk%s", idx)
+                break
             except Exception as e:
                 errors.append(f"chunk{idx}: {e}")
             done_count += 1
@@ -231,6 +275,9 @@ def run_step1(md_bytes: bytes, task_id: str,
                 except Exception:
                     pass
 
+    if cancelled is not None and cancelled.is_set():
+        raise CancelledError()
+
     if errors and not chunk_results:
         raise PipelineError("step1", "所有分块均处理失败", detail=errors)
 
@@ -239,6 +286,8 @@ def run_step1(md_bytes: bytes, task_id: str,
     seen_para: set = set()
     all_clauses: List[Dict[str, Any]] = []
     seen_all: set = set()
+    contract_price_items_all: List[Dict[str, Any]] = []
+    seen_price: set = set()
 
     # 保持按 chunk_index 排序便于阅读
     chunk_results.sort(key=lambda r: r.get("chunk_index", 0))
@@ -269,7 +318,43 @@ def run_step1(md_bytes: bytes, task_id: str,
             seen_all.add(text)
             all_clauses.append(line)
 
-    return {"paragraphs": paragraphs, "all_clauses": all_clauses}
+        # 3.3 合同总价条款聚合
+        for item in cr.get("contract_price_items", []):
+            text = (item.get("text") or "").strip()
+            if not text or text in seen_price:
+                continue
+            seen_price.add(text)
+            ctx = item.get("context", {}) or {}
+            full_ctx = ctx.get("full_context") or text
+            contract_price_items_all.append({
+                "clause": text,
+                "context": full_ctx,
+                "original_classes": list(item.get("original_classes") or []),
+                "confidence": item.get("confidence", 0.0),
+            })
+
+    contract_price: Optional[Dict[str, Any]] = None
+    if contract_price_items_all:
+        # 多条按出现顺序合并为单段（用 \n 连接）
+        clauses = [it["clause"] for it in contract_price_items_all]
+        contexts: List[str] = []
+        seen_ctx: set = set()
+        for it in contract_price_items_all:
+            c = it.get("context") or ""
+            if c and c not in seen_ctx:
+                seen_ctx.add(c)
+                contexts.append(c)
+        contract_price = {
+            "clause": "\n".join(clauses),
+            "context": "\n".join(contexts) if contexts else None,
+            "items": contract_price_items_all,
+        }
+
+    return {
+        "paragraphs": paragraphs,
+        "all_clauses": all_clauses,
+        "contract_price": contract_price,
+    }
 
 
 # ============================================================
@@ -345,6 +430,70 @@ def run_step2(paragraphs: List[Dict[str, Any]], task_id: str,
         result = resp.json()
     except Exception as e:
         raise PipelineError("step2", f"Service 2 响应 JSON 解析失败: {e}",
+                            detail=resp.text[:500])
+
+    result["_elapsed_seconds"] = elapsed
+    return result
+
+
+# ============================================================
+# 合同总金额抽取与比对（Service 2 /compare_contract_price）
+# ============================================================
+def run_compare_contract_price(clause: str,
+                               context: Optional[str],
+                               task_id: str,
+                               sis_contract_price: Optional[float] = None
+                               ) -> Dict[str, Any]:
+    """调用 Service 2 /compare_contract_price 接口。
+
+    Args:
+        clause: 合同总价条款原文（多条已合并为单段）
+        context: 上下文文本，可为 None 或空串
+        task_id: 数据标识，需匹配 [A-Za-z0-9_-]{1,64}
+        sis_contract_price: SIS 合同金额；None 时仅抽取不比对
+    """
+    cfg = config.SERVICE2_CONFIG
+    url = f"{cfg['base_url'].rstrip('/')}{config.SERVICE2_PRICE_ENDPOINT}"
+
+    payload: Dict[str, Any] = {
+        "id": task_id,
+        "contract_price_clause": clause,
+        "contract_price_clause_context": context if context else None,
+    }
+    if sis_contract_price is not None:
+        payload["sis_contract_price"] = float(sis_contract_price)
+
+    headers = {"Content-Type": "application/json"}
+    if cfg.get("api_key"):
+        headers["Authorization"] = f"Bearer {cfg['api_key']}"
+
+    start = time.time()
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=cfg["timeout"])
+    except requests.exceptions.Timeout:
+        raise PipelineError("contract_price",
+                            f"Service 2 /compare_contract_price 请求超时 ({cfg['timeout']}s)")
+    except requests.exceptions.ConnectionError as e:
+        raise PipelineError("contract_price",
+                            f"Service 2 /compare_contract_price 连接失败: {e}")
+    except Exception as e:
+        raise PipelineError("contract_price",
+                            f"Service 2 /compare_contract_price 请求异常: {e}")
+
+    elapsed = round(time.time() - start, 2)
+
+    if resp.status_code != 200:
+        raise PipelineError(
+            "contract_price",
+            f"Service 2 /compare_contract_price HTTP {resp.status_code}",
+            detail=resp.text[:500],
+        )
+
+    try:
+        result = resp.json()
+    except Exception as e:
+        raise PipelineError("contract_price",
+                            f"Service 2 响应 JSON 解析失败: {e}",
                             detail=resp.text[:500])
 
     result["_elapsed_seconds"] = elapsed

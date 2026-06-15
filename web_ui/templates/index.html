@@ -85,6 +85,13 @@
           </div>
           <button type="button" id="gt-add-row-btn" class="copy-btn">+ 添加一行</button>
           <p class="gt-hint">提示：比例和金额至少填一个。比例支持 30 或 30% 格式。</p>
+          <div style="margin-top:10px;">
+            <label for="sis_contract_price" style="font-size:13px;color:#374151;">SIS 合同总金额（元，可选）
+              <input type="number" id="sis_contract_price" name="sis_contract_price"
+                     step="0.01" min="0" placeholder="留空则仅抽取不比对"
+                     style="margin-left:6px;width:200px;" />
+            </label>
+          </div>
         </div>
 
         <div class="field">
@@ -300,6 +307,41 @@
           </table>
         </div>
       </div>
+
+      <!-- 合同总金额区块 -->
+      <section id="contract-price-section" hidden>
+        <hr class="section-divider" />
+        <h3 class="section-title">合同总金额</h3>
+        <div id="contract-price-meta" class="meta"></div>
+        <div class="table-wrap">
+          <table class="data-table" id="contract-price-table">
+            <thead>
+              <tr>
+                <th>抽取金额（contract_price）</th>
+                <th class="cp-col-sis" hidden>SIS 金额</th>
+                <th class="cp-col-diff" hidden>差额</th>
+                <th class="cp-col-result" hidden>比对结果</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div id="contract-price-compare-form" hidden style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <label style="font-size:13px;color:#374151;">SIS 合同金额（元）：
+            <input type="number" id="sis-contract-price-input" step="0.01" min="0" style="margin-left:6px;width:160px;" />
+          </label>
+          <button type="button" id="recompare-price-btn" class="copy-btn">重新对比</button>
+        </div>
+        <details style="margin-top:10px;">
+          <summary><span class="toggle-text">查看合同总价条款原文与上下文</span></summary>
+          <div style="margin-top:6px;">
+            <h4 style="margin:6px 0;font-size:12px;color:#6b7280;">条款原文</h4>
+            <pre id="contract-price-clause-pre" style="white-space:pre-wrap;word-break:break-all;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:8px;font-size:12px;max-height:200px;overflow-y:auto;"></pre>
+            <h4 style="margin:6px 0;font-size:12px;color:#6b7280;">上下文</h4>
+            <pre id="contract-price-context-pre" style="white-space:pre-wrap;word-break:break-all;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:8px;font-size:12px;max-height:200px;overflow-y:auto;"></pre>
+          </div>
+        </details>
+      </section>
     </section>
   </main>
 

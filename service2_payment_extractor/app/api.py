@@ -928,7 +928,9 @@ class ContractPriceCompareRequest(BaseModel):
         None, max_length=_MAX_CLAUSE_LEN * 4,
         description="合同总价条款上下文文本（可空）",
     )
-    sis_contract_price: float = Field(..., description="SIS 系统记录的合同金额")
+    sis_contract_price: Optional[float] = Field(
+        None, description="SIS 系统记录的合同金额；为空/未传则只抽取不比对"
+    )
 
     @field_validator("id")
     @classmethod
@@ -943,9 +945,12 @@ class ContractPriceCompareResponse(BaseModel):
     id: str
     contract_price_clause: str
     contract_price_clause_context: Optional[str] = None
-    sis_contract_price: float
+    sis_contract_price: Optional[float] = None
     contract_price: Optional[float] = Field(None, description="LLM 提取的合同总金额")
-    comparison_result: bool = Field(..., description="是否一致：|差值| ≤ 10.0 → true")
+    comparison_result: Optional[bool] = Field(
+        None,
+        description="是否一致：|差值| ≤ 10.0 → true；未传 sis_contract_price 时返回 null（不比对）",
+    )
 
 
 @app.post(
@@ -983,11 +988,17 @@ async def compare_contract_price_endpoint(request: ContractPriceCompareRequest):
             detail={"error": "Internal Server Error", "trace_id": trace_id},
         )
 
-    is_match, diff = compare_contract_price(extracted, request.sis_contract_price)
-    logger.success(
-        f"任务 {request.id} 比对完成：extracted={extracted}, sis={request.sis_contract_price}, "
-        f"diff={diff}, match={is_match}"
-    )
+    if request.sis_contract_price is None:
+        logger.success(
+            f"任务 {request.id} 仅抽取（未传 sis_contract_price）：extracted={extracted}"
+        )
+        is_match: Optional[bool] = None
+    else:
+        is_match, diff = compare_contract_price(extracted, request.sis_contract_price)
+        logger.success(
+            f"任务 {request.id} 比对完成：extracted={extracted}, sis={request.sis_contract_price}, "
+            f"diff={diff}, match={is_match}"
+        )
 
     return ContractPriceCompareResponse(
         id=request.id,

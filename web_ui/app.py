@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import queue
+import sys
 import threading
 import time
 import uuid
@@ -21,6 +23,13 @@ from werkzeug.utils import secure_filename
 
 import config, pipeline
 import history_store
+
+# ===== 日志 =====
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("web_ui.app")
 
 # 启动时初始化历史数据库
 history_store.init_db()
@@ -39,10 +48,17 @@ _SESSION_LOCK = threading.Lock()
 _SESSION_TTL = 300  # 5 分钟
 
 ALLOWED_CONTRACT_TYPES = set(config.PAYMENT_CLASS_MAP.keys())
+ALLOWED_OPERATION_TYPES = ("extract", "analyze")
 
 # 前端可配置参数的合法范围
 LINES_PER_CHUNK_RANGE = (50, 5000)
 MAX_CHARS_RANGE = (50, 5000)
+
+
+def _safe_error(stage: str, exc: BaseException, public_message: str) -> Dict[str, Any]:
+    """记录详细异常到日志，返回脱敏的对外响应体。"""
+    logger.exception("[%s] 未预期异常: %s", stage, exc)
+    return {"stage": stage, "message": public_message}
 
 
 def _parse_int_field(raw: str, field_name: str, default: int,
@@ -135,17 +151,28 @@ def upload():
 
     # 可选参数：操作模式（extract / analyze）和真值数据
     operation_type = (request.form.get("operation_type") or "extract").strip()
-    if operation_type not in ("extract", "analyze"):
-        operation_type = "extract"
+    if operation_type not in ALLOWED_OPERATION_TYPES:
+        return jsonify({
+            "error": f"operation_type 非法（允许: {list(ALLOWED_OPERATION_TYPES)}）"
+        }), 400
     gt_json_raw = (request.form.get("gt_json") or "").strip()
     sis_payment_stages = None
     if operation_type == "analyze" and gt_json_raw:
         try:
             sis_payment_stages = json.loads(gt_json_raw)
             if not isinstance(sis_payment_stages, list):
-                sis_payment_stages = None
-        except json.JSONDecodeError:
-            sis_payment_stages = None
+                return jsonify({"error": "gt_json 必须是 JSON 数组"}), 400
+        except json.JSONDecodeError as e:
+            return jsonify({"error": f"gt_json 解析失败: {e}"}), 400
+
+    # 可选参数：SIS 合同总金额（仅 analyze 模式有意义；extract 模式忽略）
+    sis_contract_price_raw = (request.form.get("sis_contract_price") or "").strip()
+    sis_contract_price: float | None = None
+    if sis_contract_price_raw:
+        try:
+            sis_contract_price = float(sis_contract_price_raw)
+        except ValueError:
+            return jsonify({"error": "sis_contract_price 必须为数字"}), 400
 
     # 可选参数：任务 ID（留空则在 /api/process 中默认生成 webui-{时间戳}）
     task_id_raw = (request.form.get("task_id") or "").strip()
@@ -172,6 +199,7 @@ def upload():
             "skip_service2": skip_service2,
             "operation_type": operation_type,
             "sis_payment_stages": sis_payment_stages,
+            "sis_contract_price": sis_contract_price,
             "task_id": task_id_raw,
             "created_at": time.time(),
         }
@@ -190,6 +218,7 @@ def upload():
 
 @app.get("/api/process")
 def process():
+    _cleanup_sessions()
     session_id = request.args.get("session_id", "").strip()
     with _SESSION_LOCK:
         session = SESSIONS.pop(session_id, None)
@@ -209,6 +238,7 @@ def process():
     skip_service2 = bool(session.get("skip_service2"))
     operation_type = session.get("operation_type") or "extract"
     sis_payment_stages = session.get("sis_payment_stages")
+    sis_contract_price = session.get("sis_contract_price")
     # 优先使用前端指定的 task_id；未指定则默认生成 webui-{时间戳}
     task_id = (session.get("task_id") or "").strip() or f"webui-{int(time.time())}"
 
@@ -218,6 +248,7 @@ def process():
             yield from _generate_inner(cancelled)
         except GeneratorExit:
             cancelled.set()
+            logger.info("SSE client disconnected, cancelling task_id=%s", task_id)
             return
 
     def _generate_inner(cancelled: threading.Event):
@@ -242,6 +273,7 @@ def process():
                     lines_per_chunk=lines_per_chunk,
                     max_chars=max_chars,
                     on_progress=_on_progress,
+                    cancelled=cancelled,
                 )
             except BaseException as e:
                 result_holder["error"] = e
@@ -273,12 +305,15 @@ def process():
         worker.join(timeout=5.0)
 
         err = result_holder.get("error")
+        if isinstance(err, pipeline.CancelledError):
+            # 客户端断开后，worker 才检测到，正常结束 generator
+            return
         if isinstance(err, pipeline.PipelineError):
             yield _sse("error", {"stage": err.stage, "message": err.message, "detail": err.detail})
             yield _sse("done", {})
             return
         if err is not None:
-            yield _sse("error", {"stage": "step1", "message": f"未预期异常: {err}"})
+            yield _sse("error", _safe_error("step1", err, "Service 1 处理失败，请查看服务端日志"))
             yield _sse("done", {})
             return
 
@@ -286,13 +321,14 @@ def process():
             step1_result = result_holder["result"]
             paragraphs_raw = step1_result.get("paragraphs", [])
             all_clauses = step1_result.get("all_clauses", [])
+            contract_price_info = step1_result.get("contract_price")
             paragraphs = pipeline.apply_contract_type(paragraphs_raw, contract_type)
         except pipeline.PipelineError as e:
             yield _sse("error", {"stage": e.stage, "message": e.message, "detail": e.detail})
             yield _sse("done", {})
             return
         except Exception as e:
-            yield _sse("error", {"stage": "step1", "message": f"未预期异常: {e}"})
+            yield _sse("error", _safe_error("step1", e, "Step 1 结果处理失败，请查看服务端日志"))
             yield _sse("done", {})
             return
 
@@ -303,6 +339,14 @@ def process():
             "all_clauses_count": len(all_clauses),
             "contract_type": contract_type,
             "filename": original_filename,
+        })
+
+        # 推送合同总价条款（即便为空也推送，便于前端清空旧状态）
+        yield _sse("contract_price_clause", {
+            "clause": (contract_price_info or {}).get("clause", ""),
+            "context": (contract_price_info or {}).get("context", ""),
+            "items": (contract_price_info or {}).get("items", []),
+            "has_data": bool(contract_price_info),
         })
 
         if skip_service2:
@@ -319,6 +363,9 @@ def process():
             yield _sse("done", {})
             return
 
+        if cancelled.is_set():
+            return
+
         yield _sse("status", {"stage": "step2_running", "message": "Service 2 处理中..."})
         try:
             step2 = pipeline.run_step2(
@@ -331,11 +378,32 @@ def process():
             yield _sse("done", {})
             return
         except Exception as e:
-            yield _sse("error", {"stage": "step2", "message": f"未预期异常: {e}"})
+            yield _sse("error", _safe_error("step2", e, "Service 2 处理失败，请查看服务端日志"))
             yield _sse("done", {})
             return
 
         yield _sse("step2", step2)
+
+        # 合同总金额抽取/比对（独立异常隔离，不阻断 done）
+        if contract_price_info and contract_price_info.get("clause"):
+            yield _sse("status", {"stage": "contract_price_running",
+                                   "message": "Service 2 合同总金额抽取/比对中..."})
+            try:
+                cp_sis = sis_contract_price if operation_type == "analyze" else None
+                cp_result = pipeline.run_compare_contract_price(
+                    contract_price_info["clause"],
+                    contract_price_info.get("context"),
+                    task_id,
+                    sis_contract_price=cp_sis,
+                )
+                yield _sse("contract_price", cp_result)
+            except pipeline.PipelineError as e:
+                yield _sse("contract_price_error",
+                           {"stage": e.stage, "message": e.message, "detail": e.detail})
+            except Exception as e:
+                body = _safe_error("contract_price", e, "合同总金额比对失败")
+                yield _sse("contract_price_error", body)
+
         yield _sse("done", {})
 
     headers = {
@@ -370,9 +438,22 @@ def rerun_step2():
     task_id = task_id_raw or f"webui-rerun-{int(time.time())}"
 
     operation_type = (data.get("operation_type") or "extract").strip()
-    if operation_type not in ("extract", "analyze"):
-        operation_type = "extract"
+    if operation_type not in ALLOWED_OPERATION_TYPES:
+        return jsonify({
+            "error": f"operation_type 非法（允许: {list(ALLOWED_OPERATION_TYPES)}）"
+        }), 400
     sis_payment_stages = data.get("sis_payment_stages") if operation_type == "analyze" else None
+
+    # 可选：合同总价条款（提供时重跑 Service 2 后再调用一次 /compare_contract_price）
+    cp_clause = (data.get("contract_price_clause") or "").strip()
+    cp_context = data.get("contract_price_clause_context") or None
+    cp_sis_raw = data.get("sis_contract_price")
+    cp_sis: float | None = None
+    if cp_sis_raw is not None and str(cp_sis_raw).strip() != "":
+        try:
+            cp_sis = float(cp_sis_raw)
+        except (TypeError, ValueError):
+            return jsonify({"error": "sis_contract_price 必须为数字"}), 400
 
     try:
         result = pipeline.run_step2(
@@ -383,7 +464,70 @@ def rerun_step2():
     except pipeline.PipelineError as e:
         return jsonify({"error": e.message, "stage": e.stage, "detail": e.detail}), 502
     except Exception as e:
-        return jsonify({"error": f"未预期异常: {e}", "stage": "step2"}), 500
+        body = _safe_error("step2", e, "Service 2 处理失败，请查看服务端日志")
+        return jsonify({"error": body["message"], "stage": body["stage"]}), 500
+
+    response = {"task_id": task_id, "result": result}
+
+    if cp_clause:
+        try:
+            cp_result = pipeline.run_compare_contract_price(
+                cp_clause, cp_context, task_id,
+                sis_contract_price=cp_sis if operation_type == "analyze" else None,
+            )
+            response["contract_price"] = cp_result
+        except pipeline.PipelineError as e:
+            response["contract_price_error"] = {
+                "stage": e.stage, "message": e.message, "detail": e.detail,
+            }
+        except Exception as e:
+            body = _safe_error("contract_price", e, "合同总金额比对失败")
+            response["contract_price_error"] = body
+
+    return jsonify(response)
+
+
+@app.post("/api/compare-contract-price")
+def api_compare_contract_price():
+    """供 analyze 模式「重新对比」按钮调用。
+
+    Body (JSON):
+        {
+          "clause": "合同总价条款原文（必填）",
+          "context": "上下文（可选）",
+          "sis_contract_price": 120000,  # 可选，缺省则仅抽取
+          "task_id": "xxx"               # 可选
+        }
+    """
+    data = request.get_json(silent=True) or {}
+    clause = (data.get("clause") or "").strip()
+    if not clause:
+        return jsonify({"error": "clause 不能为空"}), 400
+
+    context = data.get("context") or None
+
+    sis_raw = data.get("sis_contract_price")
+    sis_value: float | None = None
+    if sis_raw is not None and str(sis_raw).strip() != "":
+        try:
+            sis_value = float(sis_raw)
+        except (TypeError, ValueError):
+            return jsonify({"error": "sis_contract_price 必须为数字"}), 400
+
+    task_id_raw = (data.get("task_id") or "").strip()
+    if len(task_id_raw) > 64:
+        return jsonify({"error": "task_id 长度不能超过 64"}), 400
+    task_id = task_id_raw or f"webui-cp-{int(time.time())}"
+
+    try:
+        result = pipeline.run_compare_contract_price(
+            clause, context, task_id, sis_contract_price=sis_value,
+        )
+    except pipeline.PipelineError as e:
+        return jsonify({"error": e.message, "stage": e.stage, "detail": e.detail}), 502
+    except Exception as e:
+        body = _safe_error("contract_price", e, "合同总金额比对失败，请查看服务端日志")
+        return jsonify({"error": body["message"], "stage": body["stage"]}), 500
 
     return jsonify({"task_id": task_id, "result": result})
 
@@ -436,51 +580,15 @@ def export_excel():
     if not payment_items and not warranty_items:
         return jsonify({"error": "无数据可导出"}), 400
 
-    # 过滤为合法字段
-    valid_payment_keys = {k for k, _ in PAYMENT_FIELDS}
-    valid_warranty_keys = {k for k, _ in WARRANTY_FIELDS}
     pay_fields = [(k, v) for k, v in PAYMENT_FIELDS if k in selected_payment_fields]
     war_fields = [(k, v) for k, v in WARRANTY_FIELDS if k in selected_warranty_fields]
 
-    wb = openpyxl.Workbook()
-
-    # 付款条款 Sheet
-    if payment_items and pay_fields:
-        ws = wb.active
-        ws.title = "付款条款"
-        ws.append([label for _, label in pay_fields])
-        for item in payment_items:
-            row = []
-            for key, _ in pay_fields:
-                val = item.get(key, "")
-                row.append(str(val) if val is not None else "")
-            ws.append(row)
-        # 自适应列宽
-        for col_idx, (key, _) in enumerate(pay_fields, 1):
-            max_len = max(
-                len(str(ws.cell(row=r, column=col_idx).value or ""))
-                for r in range(1, ws.max_row + 1)
-            )
-            ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(max_len + 4, 60)
-
-    # 质保期 Sheet
-    if warranty_items and war_fields:
-        ws2 = wb.create_sheet("质保期") if payment_items and pay_fields else wb.active
-        if not (payment_items and pay_fields):
-            ws2.title = "质保期"
-        ws2.append([label for _, label in war_fields])
-        for item in warranty_items:
-            row = []
-            for key, _ in war_fields:
-                val = item.get(key, "")
-                row.append(str(val) if val is not None else "")
-            ws2.append(row)
-        for col_idx, (key, _) in enumerate(war_fields, 1):
-            max_len = max(
-                len(str(ws2.cell(row=r, column=col_idx).value or ""))
-                for r in range(1, ws2.max_row + 1)
-            )
-            ws2.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(max_len + 4, 60)
+    wb = _build_export_workbook([
+        ("付款条款", payment_items, pay_fields),
+        ("质保期", warranty_items, war_fields),
+    ])
+    if wb is None:
+        return jsonify({"error": "无可导出的字段"}), 400
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -495,6 +603,37 @@ def export_excel():
         as_attachment=True,
         download_name=filename,
     )
+
+
+def _build_export_workbook(sheets):
+    """构造 Excel 工作簿。sheets: List[(sheet_name, items, fields)]。
+
+    没有任何可写 sheet 时返回 None。
+    """
+    import openpyxl
+
+    populated = [(name, items, fields) for name, items, fields in sheets if items and fields]
+    if not populated:
+        return None
+
+    wb = openpyxl.Workbook()
+    # 移除默认 sheet，统一用 create_sheet 显式创建，避免名称/状态二义
+    default_sheet = wb.active
+    wb.remove(default_sheet)
+
+    for sheet_name, items, fields in populated:
+        ws = wb.create_sheet(sheet_name)
+        ws.append([label for _, label in fields])
+        for item in items:
+            row = [str(item.get(k, "") or "") for k, _ in fields]
+            ws.append(row)
+        for col_idx, _ in enumerate(fields, 1):
+            max_len = max(
+                len(str(ws.cell(row=r, column=col_idx).value or ""))
+                for r in range(1, ws.max_row + 1)
+            )
+            ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(max_len + 4, 60)
+    return wb
 
 
 # ============================================================
@@ -524,7 +663,10 @@ def api_history_create():
     data = request.get_json(silent=True) or {}
     if not data.get("id"):
         return jsonify({"error": "缺少 id 字段"}), 400
-    history_store.create_record(data)
+    try:
+        history_store.create_record(data)
+    except history_store.DuplicateRecordError:
+        return jsonify({"error": "记录 id 已存在", "id": data["id"]}), 409
     return jsonify({"ok": True, "id": data["id"]})
 
 
@@ -546,8 +688,6 @@ def api_history_clear():
 @app.post("/api/history/export")
 def api_history_export():
     """批量导出勾选的历史记录到 Excel。"""
-    import openpyxl
-
     body = request.get_json(silent=True) or {}
     ids = body.get("ids") or []
     if not ids:
@@ -582,40 +722,12 @@ def api_history_export():
     if not all_payment_items and not all_warranty_items:
         return jsonify({"error": "所选记录中无 Step 2 数据"}), 400
 
-    # 默认导出全部字段
-    pay_fields = list(PAYMENT_FIELDS)
-    war_fields = list(WARRANTY_FIELDS)
-
-    wb = openpyxl.Workbook()
-
-    if all_payment_items and pay_fields:
-        ws = wb.active
-        ws.title = "付款条款"
-        ws.append([label for _, label in pay_fields])
-        for item in all_payment_items:
-            row = [str(item.get(k, "") or "") for k, _ in pay_fields]
-            ws.append(row)
-        for col_idx, (key, _) in enumerate(pay_fields, 1):
-            max_len = max(
-                len(str(ws.cell(row=r, column=col_idx).value or ""))
-                for r in range(1, ws.max_row + 1)
-            )
-            ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(max_len + 4, 60)
-
-    if all_warranty_items and war_fields:
-        ws2 = wb.create_sheet("质保期") if all_payment_items and pay_fields else wb.active
-        if not (all_payment_items and pay_fields):
-            ws2.title = "质保期"
-        ws2.append([label for _, label in war_fields])
-        for item in all_warranty_items:
-            row = [str(item.get(k, "") or "") for k, _ in war_fields]
-            ws2.append(row)
-        for col_idx, (key, _) in enumerate(war_fields, 1):
-            max_len = max(
-                len(str(ws2.cell(row=r, column=col_idx).value or ""))
-                for r in range(1, ws2.max_row + 1)
-            )
-            ws2.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(max_len + 4, 60)
+    wb = _build_export_workbook([
+        ("付款条款", all_payment_items, list(PAYMENT_FIELDS)),
+        ("质保期", all_warranty_items, list(WARRANTY_FIELDS)),
+    ])
+    if wb is None:
+        return jsonify({"error": "无可导出的字段"}), 400
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -660,6 +772,14 @@ if __name__ == "__main__":
     else:
         active = config.SERVICE2_CONFIG
 
+    # 安全：remote 模式必须显式注入 API Key
+    if config.SERVICE2_MODE == "remote" and not active.get("api_key"):
+        logger.error(
+            "SERVICE2_MODE=remote 但未设置 SERVICE2_API_KEY 环境变量；"
+            "请通过环境变量注入后重新启动。"
+        )
+        sys.exit(2)
+
     host = _args.host or config.HOST
     # 端口默认按 --mode 区分：remote=5000，local=5001；用户显式 --port 则覆盖
     if _args.port is not None:
@@ -667,11 +787,11 @@ if __name__ == "__main__":
     else:
         port = 5000 if config.SERVICE2_MODE == "remote" else 5001
 
-    print("=" * 60)
-    print(f"  Service 1 URL : {config.SERVICE1_CONFIG['base_url']}")
-    print(f"  Service 2 MODE: {config.SERVICE2_MODE}")
-    print(f"  Service 2 URL : {active['base_url']}{active['endpoint']}")
-    print(f"  Web listening : http://{host}:{port}")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("Service 1 URL : %s", config.SERVICE1_CONFIG['base_url'])
+    logger.info("Service 2 MODE: %s", config.SERVICE2_MODE)
+    logger.info("Service 2 URL : %s%s", active['base_url'], active['endpoint'])
+    logger.info("Web listening : http://%s:%s", host, port)
+    logger.info("=" * 60)
 
     app.run(host=host, port=port, debug=False, threaded=True)

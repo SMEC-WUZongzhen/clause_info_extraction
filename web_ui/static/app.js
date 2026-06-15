@@ -31,6 +31,12 @@ let lastOperationType = "extract"; // 最近一次操作模式
 let lastGtPaymentStages = null;    // 最近一次真值数据（analyze 模式）
 let currentHistoryTab = "extract"; // 历史记录当前 Tab
 
+// 合同总金额相关缓存
+let lastContractPriceClause = "";   // 合同总价条款原文（多条已合并）
+let lastContractPriceContext = "";  // 合同总价条款上下文
+let lastContractPriceResult = null; // /compare_contract_price 响应
+let lastSisContractPrice = null;    // 用户最近输入的 SIS 金额
+
 // ===== 耗时统计 =====
 const timers = {
   step1Start: 0,
@@ -110,6 +116,14 @@ function resetUI() {
   els.statusMsg.textContent = "";
   resetTimers();
   setRerunBtnEnabled(false);
+  // 清空合同总金额状态
+  lastContractPriceClause = "";
+  lastContractPriceContext = "";
+  lastContractPriceResult = null;
+  const cpSec = document.getElementById("contract-price-section");
+  if (cpSec) cpSec.hidden = true;
+  const cpMeta = document.getElementById("contract-price-meta");
+  if (cpMeta) cpMeta.innerHTML = "";
 }
 
 function setRerunBtnEnabled(enabled) {
@@ -542,6 +556,42 @@ function startProcess(sessionId) {
     }
   });
 
+  currentEventSource.addEventListener("contract_price_clause", (evt) => {
+    try {
+      const payload = JSON.parse(evt.data);
+      lastContractPriceClause = payload.clause || "";
+      lastContractPriceContext = payload.context || "";
+      // 重置上一次结果；若无数据则隐藏区块
+      if (!payload.has_data) {
+        lastContractPriceResult = null;
+        renderContractPriceSection();
+      } else {
+        // 显示区块（结果暂未到达，先显示原文 + 占位）
+        renderContractPriceSection();
+      }
+    } catch (_) {}
+  });
+
+  currentEventSource.addEventListener("contract_price", (evt) => {
+    try {
+      lastContractPriceResult = JSON.parse(evt.data);
+      renderContractPriceSection();
+    } catch (_) {}
+  });
+
+  currentEventSource.addEventListener("contract_price_error", (evt) => {
+    try {
+      const { message } = JSON.parse(evt.data || "{}");
+      const meta = document.getElementById("contract-price-meta");
+      if (meta) {
+        meta.innerHTML = `<span style="color:#b91c1c">合同总金额比对失败：${esc(message || "未知错误")}</span>`;
+      }
+      // 仍要显示区块以便看到原文
+      const sec = document.getElementById("contract-price-section");
+      if (sec) sec.hidden = !lastContractPriceClause;
+    } catch (_) {}
+  });
+
   currentEventSource.addEventListener("done", () => {
     currentEventSource.close();
     currentEventSource = null;
@@ -640,35 +690,61 @@ function renderCompareResult(result) {
     if (cat === "installation_payment") return "安装";
     return "-";
   };
-  // 从提取结果构建 payment_type → clause_category 映射
-  const catLookup = {};
+  // 从提取结果构建映射
+  const catLookup = {};       // payment_type → clause_category（同名可能覆盖，仅兜底）
+  const codeToCats = {};      // payment_code → [clause_category, ...]（共享编码可含多个）
   const extraction = (lastStep2Result && lastStep2Result.extraction_result) || [];
   extraction.forEach((it) => {
     if (it.payment_type && it.clause_category) {
       catLookup[it.payment_type] = it.clause_category;
     }
+    if (it.payment_code && it.clause_category) {
+      if (!codeToCats[it.payment_code]) codeToCats[it.payment_code] = [];
+      if (!codeToCats[it.payment_code].includes(it.clause_category)) {
+        codeToCats[it.payment_code].push(it.clause_category);
+      }
+    }
   });
   // 从 GT 数据构建 stage → category 映射（用于漏提取项）
   const gtCatLookup = {};
+  const gtCodeToCats = {};    // GT 中 stage 对应的标准编码 → category
   (lastGtPaymentStages || []).forEach((gt) => {
     if (gt.stage && gt.category) {
       gtCatLookup[gt.stage] = gt.category;
     }
   });
-  // payment_code 兜底映射（设备独有 / 安装独有节点）
+  // 共享编码兜底：若编码在提取结果中只出现一种类别，则采用；多种则取 GT 中出现最多的类别
+  const resolveSharedCode = (code) => {
+    const cats = codeToCats[code];
+    if (!cats || !cats.length) return "";
+    if (cats.length === 1) return cats[0];
+    // 多种类别 → 看 GT 中哪个类别多
+    const gtCats = Object.values(gtCatLookup);
+    const eqCount = gtCats.filter((c) => c === "equipment_payment").length;
+    const instCount = gtCats.filter((c) => c === "installation_payment").length;
+    if (eqCount > instCount) return "equipment_payment";
+    if (instCount > eqCount) return "installation_payment";
+    return cats[0]; // 默认取第一个
+  };
+  // payment_code 固有映射（设备独有 / 安装独有节点）
   const _EQ_ONLY = new Set(["EARNEST","DEPOSIT","WITHDRAWAL","Z001","Z002","Z021","Z022"]);
   const _INST_ONLY = new Set(["Z018","DOWNPAYMENT","Z027","Z028","Z019"]);
-  const codeToCat = (code) => {
+  const codeToCatFixed = (code) => {
     if (!code) return "";
     if (_EQ_ONLY.has(code)) return "equipment_payment";
     if (_INST_ONLY.has(code)) return "installation_payment";
     return "";
   };
   // 综合解析节点类型
-  // isExtracted: 提取结果自带 clause_category，应直接使用；catLookup 仅兜底给漏提取项
+  // isExtracted: 提取结果自带 clause_category，应直接使用；其余走兜底链
   const resolveCategory = (it, isExtracted) => {
     if (isExtracted && it.clause_category) return it.clause_category;
-    return it.clause_category || catLookup[it.payment_type] || gtCatLookup[it.payment_type] || codeToCat(it.payment_code) || "";
+    return it.clause_category
+      || catLookup[it.payment_type]
+      || gtCatLookup[it.payment_type]
+      || (it.payment_code && resolveSharedCode(it.payment_code))
+      || codeToCatFixed(it.payment_code)
+      || "";
   };
 
   // 构建正确匹配集合 (payment_type + "|" + payment_ratio)
@@ -741,6 +817,139 @@ function renderCompareResult(result) {
     : `<tr><td colspan="7" style="text-align:center;color:#9ca3af">无</td></tr>`;
 }
 
+// ===== 合同总金额渲染 =====
+function _fmtPrice(v) {
+  if (v == null || v === "") return "-";
+  const n = Number(v);
+  if (Number.isNaN(n)) return String(v);
+  return n.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+}
+
+function renderContractPriceSection() {
+  const sec = document.getElementById("contract-price-section");
+  if (!sec) return;
+
+  // 无原文 → 隐藏整个区块
+  if (!lastContractPriceClause) {
+    sec.hidden = true;
+    return;
+  }
+  sec.hidden = false;
+
+  // 写入原文/上下文
+  const cPre = document.getElementById("contract-price-clause-pre");
+  const ctxPre = document.getElementById("contract-price-context-pre");
+  if (cPre) cPre.textContent = lastContractPriceClause;
+  if (ctxPre) ctxPre.textContent = lastContractPriceContext || "(无)";
+
+  const isAnalyze = lastOperationType === "analyze";
+
+  // 列显隐控制
+  sec.querySelectorAll(".cp-col-sis, .cp-col-diff, .cp-col-result").forEach((th) => {
+    th.hidden = !isAnalyze;
+  });
+
+  // 比对表单（仅 analyze）
+  const form = document.getElementById("contract-price-compare-form");
+  if (form) form.hidden = !isAnalyze;
+  const sisInput = document.getElementById("sis-contract-price-input");
+  if (sisInput && isAnalyze) {
+    const r = lastContractPriceResult;
+    const v = (r && r.sis_contract_price != null) ? r.sis_contract_price : lastSisContractPrice;
+    sisInput.value = (v != null ? v : "");
+  }
+
+  // 渲染表格行
+  const tbody = document.querySelector("#contract-price-table tbody");
+  if (!tbody) return;
+  const r = lastContractPriceResult;
+  if (!r) {
+    const cols = isAnalyze ? 4 : 1;
+    tbody.innerHTML = `<tr><td colspan="${cols}" style="text-align:center;color:#9ca3af">等待 Service 2 返回...</td></tr>`;
+    return;
+  }
+  const cp = r.contract_price;
+  const sis = r.sis_contract_price;
+  const cmp = r.comparison_result;
+  let diffStr = "-";
+  let resultHtml = "-";
+  if (isAnalyze) {
+    if (cp != null && sis != null) {
+      const diff = Number(cp) - Number(sis);
+      diffStr = _fmtPrice(diff);
+    }
+    if (cmp === true) {
+      resultHtml = `<span class="tag" style="background:#dcfce7;color:#166534">一致</span>`;
+    } else if (cmp === false) {
+      resultHtml = `<span class="tag" style="background:#fee2e2;color:#991b1b">不一致</span>`;
+    } else {
+      resultHtml = `<span style="color:#9ca3af">未比对</span>`;
+    }
+  }
+  const row = `
+    <tr>
+      <td>${esc(_fmtPrice(cp))}</td>
+      ${isAnalyze ? `<td>${esc(_fmtPrice(sis))}</td><td>${esc(diffStr)}</td><td>${resultHtml}</td>` : ""}
+    </tr>`;
+  tbody.innerHTML = row;
+
+  // meta 状态
+  const meta = document.getElementById("contract-price-meta");
+  if (meta) {
+    if (cp == null) {
+      meta.innerHTML = `<span style="color:#b45309">未抽取到金额（条款可能不含金额或解析失败）</span>`;
+    } else {
+      meta.innerHTML = "";
+    }
+  }
+}
+
+// 重新对比按钮
+document.getElementById("recompare-price-btn")?.addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  if (!lastContractPriceClause) {
+    alert("尚未识别到合同总价条款");
+    return;
+  }
+  const sisInput = document.getElementById("sis-contract-price-input");
+  const sisRaw = (sisInput && sisInput.value || "").trim();
+  let sisVal = null;
+  if (sisRaw !== "") {
+    sisVal = Number(sisRaw);
+    if (Number.isNaN(sisVal)) { alert("SIS 金额必须为数字"); return; }
+  }
+  lastSisContractPrice = sisVal;
+
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = "对比中...";
+  try {
+    const resp = await fetch("/api/compare-contract-price", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        clause: lastContractPriceClause,
+        context: lastContractPriceContext || null,
+        sis_contract_price: sisVal,
+        task_id: (document.getElementById("task_id")?.value || "").trim() || undefined,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      alert(data.error || `HTTP ${resp.status}`);
+      return;
+    }
+    lastContractPriceResult = data.result || null;
+    renderContractPriceSection();
+  } catch (err) {
+    alert(`请求失败: ${err}`);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+});
+
+
 // ===== 表单提交 =====
 els.form.addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -787,8 +996,20 @@ els.form.addEventListener("submit", async (e) => {
     if (!gtData) { alert("对比模式下请至少输入一条真值数据"); els.submitBtn.disabled = false; return; }
     lastGtPaymentStages = gtData;
     fd.append("gt_json", JSON.stringify(gtData));
+    // SIS 合同总金额（可选）
+    const sisInput = document.getElementById("sis_contract_price");
+    const sisRaw = (sisInput && sisInput.value || "").trim();
+    if (sisRaw !== "") {
+      const v = Number(sisRaw);
+      if (Number.isNaN(v)) { alert("SIS 合同总金额必须为数字"); els.submitBtn.disabled = false; return; }
+      lastSisContractPrice = v;
+      fd.append("sis_contract_price", String(v));
+    } else {
+      lastSisContractPrice = null;
+    }
   } else {
     lastGtPaymentStages = null;
+    lastSisContractPrice = null;
   }
 
   try {
@@ -924,8 +1145,23 @@ document.getElementById("rerun-step2-btn")?.addEventListener("click", async (e) 
       lastGtPaymentStages = gtData;
       rerunBody.sis_payment_stages = gtData;
     }
+    // SIS 合同金额（与上传表单同字段）
+    const sisInput = document.getElementById("sis_contract_price");
+    const sisRaw = (sisInput && sisInput.value || "").trim();
+    if (sisRaw !== "") {
+      const v = Number(sisRaw);
+      if (!Number.isNaN(v)) {
+        lastSisContractPrice = v;
+        rerunBody.sis_contract_price = v;
+      }
+    }
   } else {
     lastGtPaymentStages = null;
+  }
+  // 合同总价条款（即便 extract 模式也允许重跑抽取，仅 analyze 模式发送 sis）
+  if (lastContractPriceClause) {
+    rerunBody.contract_price_clause = lastContractPriceClause;
+    rerunBody.contract_price_clause_context = lastContractPriceContext || null;
   }
 
   try {
@@ -944,6 +1180,14 @@ document.getElementById("rerun-step2-btn")?.addEventListener("click", async (e) 
     // 若包含对比数据则渲染对比结果
     if (data.result && (data.result.correct_payments || data.result.missed_payments || data.result.false_payments)) {
       renderCompareResult(data.result);
+    }
+    // 合同总金额结果（若服务端返回）
+    if (data.contract_price) {
+      lastContractPriceResult = data.contract_price;
+      renderContractPriceSection();
+    } else if (data.contract_price_error) {
+      const meta = document.getElementById("contract-price-meta");
+      if (meta) meta.innerHTML = `<span style="color:#b91c1c">合同总金额比对失败：${esc(data.contract_price_error.message || "")}</span>`;
     }
     els.step2Card.hidden = false;
     els.step2Card.scrollIntoView({ behavior: "smooth", block: "start" });

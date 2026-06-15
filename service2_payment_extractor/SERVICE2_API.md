@@ -565,9 +565,11 @@ Content-Type: application/json
 | `id` | string | ✅ | 数据标识，仅允许 `[A-Za-z0-9_-]{1,64}` |
 | `contract_price_clause` | string | ✅ | 合同总价条款原文 |
 | `contract_price_clause_context` | string/null | ❌ | 合同总价条款上下文文本，可为 `null` 或空串 |
-| `sis_contract_price` | float | ✅ | SIS 系统记录的合同金额（单位：元） |
+| `sis_contract_price` | float | ❌ | SIS 系统记录的合同金额（单位：元）；**未传或为 `null` 时只抽取、不比对**，响应中的 `comparison_result` 返回 `null` |
 
 #### 请求示例
+
+##### 示例 1：抽取并比对（传入 SIS 金额）
 
 ```bash
 curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/compare_contract_price \
@@ -581,9 +583,21 @@ curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/compare_contract_price \
   }'
 ```
 
+##### 示例 2：仅抽取，不比对（省略 `sis_contract_price`）
+
+```bash
+curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/compare_contract_price \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer 7d9b2e17-2290d95b9773-2e862b5cee2c" \
+  -d '{
+    "id": "price-002",
+    "contract_price_clause": "合同总价款人民币壹拾贰万元整（￥120000元）"
+  }'
+```
+
 #### 响应
 
-##### 成功响应 (200 OK)
+##### 成功响应 - 抽取并比对 (200 OK)
 
 ```json
 {
@@ -596,6 +610,19 @@ curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/compare_contract_price \
 }
 ```
 
+##### 成功响应 - 仅抽取（未传 SIS 金额）(200 OK)
+
+```json
+{
+  "id": "price-002",
+  "contract_price_clause": "合同总价款人民币壹拾贰万元整（￥120000元）",
+  "contract_price_clause_context": null,
+  "sis_contract_price": null,
+  "contract_price": 120000.0,
+  "comparison_result": null
+}
+```
+
 ##### 响应字段说明
 
 | 字段 | 类型 | 描述 |
@@ -603,9 +630,9 @@ curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/compare_contract_price \
 | `id` | string | 原样回带请求 ID |
 | `contract_price_clause` | string | 原样回带请求条款文本 |
 | `contract_price_clause_context` | string/null | 原样回带请求上下文 |
-| `sis_contract_price` | float | 原样回带 SIS 金额 |
+| `sis_contract_price` | float/null | 原样回带 SIS 金额；未传时为 `null` |
 | `contract_price` | float/null | LLM 提取出的合同总金额；条款无金额或解析失败时为 `null` |
-| `comparison_result` | boolean | 是否一致：`abs(contract_price - sis_contract_price) ≤ 10.0` 时为 `true`；`contract_price` 为 `null` 时一律为 `false` |
+| `comparison_result` | boolean/null | 一致性结果：`abs(contract_price - sis_contract_price) ≤ 10.0` → `true`；`contract_price` 为 `null` → `false`；**`sis_contract_price` 未传 → `null`（不比对）** |
 
 ##### 错误响应
 
@@ -938,6 +965,7 @@ F1 = 2 × (精确率 × 召回率) / (精确率 + 召回率)
 
 | 版本 | 日期 | 变更说明 |
 |------|------|----------|
+| **v1.8.2** | 2026-06 | `/compare_contract_price` 的 `sis_contract_price` 改为可选：未传或为 `null` 时仅做 LLM 抽取，不进行比对，响应中 `comparison_result` 返回 `null`、`sis_contract_price` 也回带 `null`。已传值时行为与 v1.8.1 完全一致。 |
 | **v1.8.1** | 2026-06 | **Breaking**: `analyze` 模式请求字段 `gt_payment_stages` 重命名为 `sis_payment_stages`；422 错误信息中的 `loc` 同步更新；其余字段语义、归一化规则与响应结构保持不变。客户端需同步替换字段名，旧字段不再兼容。 |
 | **v1.8.0** | 2026-06 | 新增 `POST /compare_contract_price` 接口：基于 LLM 从合同总价条款抽取金额（提示词 `CONTRACT_PRICE_EXTRACTION_PROMPT` 位于 `app/config/prompts.py`），与 `sis_contract_price` 做硬编码差值比对（阈值固定 `10.0` 元）。新增 Service 层 `app/utils/contract_price_comparator.py`；DTO `ContractPriceCompareRequest` / `ContractPriceCompareResponse` 定义于 `app/api.py`。 |
 | **v1.7.1** | 2026-06 | `analyze` 模式的 `correct_payments` / `missed_payments` / `false_payments` 现统一应用标准节点映射（`payment_type` 输出映射后名称），新增 `payment_code`、`payment_days`、`latest_payment_stage`、`latest_payment_date`、`special_clause_content` 字段（后 4 个为占位，当前返回 `null`），与 `extraction_result` 中 `PaymentItem` 输出字段保持一致。 |

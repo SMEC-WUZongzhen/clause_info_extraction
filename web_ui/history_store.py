@@ -14,6 +14,10 @@ import sqlite3
 from typing import Any, Dict, List, Optional
 
 
+class DuplicateRecordError(Exception):
+    """主键冲突时抛出，由上层 API 转 409。"""
+
+
 _DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.db")
 MAX_RECORDS = 500  # 存储上限，超出则淘汰最旧记录
 
@@ -153,36 +157,50 @@ def get_records_by_ids(ids: List[str]) -> List[Dict[str, Any]]:
         conn.close()
 
 
+def _dump_optional_json(value: Any) -> str:
+    """None → ""；其它值 → json 字符串。避免 'null' 与空值混淆。"""
+    if value is None:
+        return ""
+    return json.dumps(value, ensure_ascii=False)
+
+
 def create_record(data: Dict[str, Any]) -> None:
-    """插入一条历史记录。"""
+    """插入一条历史记录。
+
+    Raises:
+        DuplicateRecordError: 当 id 已存在时抛出（不再静默覆盖）。
+    """
     conn = _connect()
     try:
-        conn.execute(
-            """INSERT OR REPLACE INTO history
-               (id, created_at, filename, contract_type, contract_type_label,
-                type_summary, ratio_summary, amount_summary, step2_elapsed,
-                step1_data, step2_data, payment_items, warranty_items,
-                operation_type, gt_data, compare_data)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                data.get("id", ""),
-                data.get("createdAt", ""),
-                data.get("filename", ""),
-                data.get("contractType", ""),
-                data.get("contractTypeLabel", ""),
-                data.get("typeSummary", "-"),
-                data.get("ratioSummary", "-"),
-                data.get("amountSummary", "-"),
-                data.get("step2Elapsed"),
-                json.dumps(data.get("step1Data"), ensure_ascii=False) or "",
-                json.dumps(data.get("step2Data"), ensure_ascii=False) or "",
-                json.dumps(data.get("paymentItems", []), ensure_ascii=False),
-                json.dumps(data.get("warrantyItems", []), ensure_ascii=False),
-                data.get("operationType", "extract"),
-                json.dumps(data.get("gtData"), ensure_ascii=False) or "",
-                json.dumps(data.get("compareData"), ensure_ascii=False) or "",
-            ),
-        )
+        try:
+            conn.execute(
+                """INSERT INTO history
+                   (id, created_at, filename, contract_type, contract_type_label,
+                    type_summary, ratio_summary, amount_summary, step2_elapsed,
+                    step1_data, step2_data, payment_items, warranty_items,
+                    operation_type, gt_data, compare_data)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    data.get("id", ""),
+                    data.get("createdAt", ""),
+                    data.get("filename", ""),
+                    data.get("contractType", ""),
+                    data.get("contractTypeLabel", ""),
+                    data.get("typeSummary", "-"),
+                    data.get("ratioSummary", "-"),
+                    data.get("amountSummary", "-"),
+                    data.get("step2Elapsed"),
+                    _dump_optional_json(data.get("step1Data")),
+                    _dump_optional_json(data.get("step2Data")),
+                    json.dumps(data.get("paymentItems", []), ensure_ascii=False),
+                    json.dumps(data.get("warrantyItems", []), ensure_ascii=False),
+                    data.get("operationType", "extract"),
+                    _dump_optional_json(data.get("gtData")),
+                    _dump_optional_json(data.get("compareData")),
+                ),
+            )
+        except sqlite3.IntegrityError as e:
+            raise DuplicateRecordError(str(e)) from e
         conn.commit()
         # FIFO 淘汰：超出上限时删除最旧记录
         count = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]

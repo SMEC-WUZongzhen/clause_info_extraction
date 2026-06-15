@@ -33,33 +33,85 @@ def compare_contract_price(extracted: Optional[float], sis: float) -> Tuple[bool
     return diff <= _PRICE_DIFF_TOLERANCE, diff
 
 
+def _coerce_number(v) -> Optional[float]:
+    """把 LLM 可能输出的金额值（int / float / 带逗号空格的字符串）转成 float。"""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        s = v.strip().replace(",", "").replace(" ", "").replace("，", "")
+        # 去掉常见货币前缀
+        s = re.sub(r"^(?:￥|¥|RMB|人民币)", "", s, flags=re.IGNORECASE)
+        if not s or s.lower() == "null":
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    return None
+
+
 def _parse_price_from_response(text: str) -> Optional[float]:
-    """从 LLM 输出中稳健地解析 contract_price。"""
+    """从 LLM 输出中稳健地解析 contract_price。
+
+    LLM 实际可能输出形如：
+        【节点识别】... 一大段思考 ...
+        {"contract_price": "4308000"}
+    或带 ```json ... ``` 包裹、值为字符串 / 带千分位逗号 / 整数 / 小数 等多种形态。
+    解析顺序：
+      1. 整段直接 json.loads
+      2. 用 JSONDecoder 滑窗扫描所有 {...} 块，取**最后一个**含 contract_price 的对象
+      3. 正则匹配 "contract_price": <数字 | "字符串" | null>
+    """
     if not text:
         return None
     raw = text.strip()
-    # 去除可能的 ```json ... ``` 包裹
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
+    # 去除可能的 ```json ... ``` 包裹（含中间）
+    raw = re.sub(r"```(?:json)?", "", raw, flags=re.IGNORECASE).strip()
+    raw = raw.strip("`").strip()
 
-    # 1) 直接 JSON 解析
+    # 1) 整段 json.loads
     try:
         data = json.loads(raw)
         if isinstance(data, dict) and "contract_price" in data:
-            v = data["contract_price"]
-            if v is None:
-                return None
-            return float(v)
+            return _coerce_number(data["contract_price"])
     except (TypeError, ValueError):
         pass
 
-    # 2) 兜底：正则提取首个数字
-    m = re.search(r'"contract_price"\s*:\s*(null|-?\d+(?:\.\d+)?)', raw)
-    if m:
-        val = m.group(1)
-        return None if val == "null" else float(val)
+    # 2) 滑窗扫描所有顶层 JSON 对象，优先取最后一个命中的（LLM 常把 JSON 放在最后）
+    decoder = json.JSONDecoder()
+    n = len(raw)
+    i = 0
+    last_hit: Optional[float] = None
+    while i < n:
+        if raw[i] == "{":
+            try:
+                obj, end = decoder.raw_decode(raw, i)
+                if isinstance(obj, dict) and "contract_price" in obj:
+                    last_hit = _coerce_number(obj["contract_price"])
+                i = end
+                continue
+            except json.JSONDecodeError:
+                i += 1
+                continue
+        i += 1
+    if last_hit is not None:
+        return last_hit
 
-    m2 = re.search(r"-?\d+(?:\.\d+)?", raw)
-    return float(m2.group(0)) if m2 else None
+    # 3) 正则兜底：支持 number / "string" / null 三种值形态
+    m = re.search(
+        r'"contract_price"\s*:\s*(null|"([^"]*)"|(-?\d[\d,\s]*(?:\.\d+)?))',
+        raw,
+    )
+    if m:
+        if m.group(1) == "null":
+            return None
+        return _coerce_number(m.group(2) if m.group(2) is not None else m.group(3))
+
+    # 4) 最终兜底：捕获形如 4,308,000 / 4308000 / 4308000.50 的连续数字串（允许逗号千分位）
+    m2 = re.search(r"-?\d{1,3}(?:[,，]\d{3})+(?:\.\d+)?|-?\d+(?:\.\d+)?", raw)
+    return _coerce_number(m2.group(0)) if m2 else None
 
 
 async def extract_contract_price(

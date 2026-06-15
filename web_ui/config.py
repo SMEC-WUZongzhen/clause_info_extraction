@@ -37,7 +37,8 @@ SERVICE2_LOCAL_CONFIG = {
 SERVICE2_REMOTE_CONFIG = {
     "base_url": _env("SERVICE2_REMOTE_BASE_URL", "http://106.13.172.186/s-r644699c4b7c/8000"),
     "endpoint": _env("SERVICE2_ENDPOINT", "/extract_payment_info"),
-    "api_key": _env("SERVICE2_API_KEY", "7d9b2e17-2290d95b9773-2e862b5cee2c"),
+    # 安全：禁止把生产 API Key 硬编码进源码。请通过环境变量 SERVICE2_API_KEY 注入。
+    "api_key": _env("SERVICE2_API_KEY", ""),
     "timeout": _env("SERVICE2_TIMEOUT", 600),
 }
 
@@ -81,3 +82,9 @@ PAYMENT_CLASS_MAP = {
 # 需要覆盖的「付款类」判定关键字（对应 Service 1 内 mapped_class）
 PAYMENT_MAPPED_ALIASES = {"混签付款条款", "安装付款条款", "设备付款条款"}
 WARRANTY_MAPPED_ALIASES = {"质保期条款"}
+
+# 合同总价条款 raw clause_class（Service 1 输出标签）
+CONTRACT_PRICE_RAW_CLASS = "contract_price"
+
+# Service 2 合同总金额比对端点
+SERVICE2_PRICE_ENDPOINT = _env("SERVICE2_PRICE_ENDPOINT", "/compare_contract_price")

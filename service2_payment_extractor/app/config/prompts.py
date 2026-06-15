@@ -794,8 +794,10 @@ CONTRACT_PRICE_EXTRACTION_PROMPT = """你是合同金额抽取专家。请从下
 5. 严禁推理、估算或借助上下文之外的信息；上下文仅辅助理解条款，不得引用其中的数字推断总价。
 
 ## 输出格式（必须严格遵守）
-只输出一行 JSON，禁止 markdown、禁止解释文字：
-{{"contract_price": <number|null>}}
+- 仅输出一行合法 JSON，前后**禁止**任何文字、解释、Markdown、代码块、思考过程。
+- `contract_price` 必须为**纯数字**（int 或 float）；**禁止字符串、禁止千分位逗号、禁止单位/货币前缀**；无法抽取时为 `null`。
+- 合法示例：`{{"contract_price": 4308000}}` 或 `{{"contract_price": null}}`
+- 非法示例（绝对不要这样输出）：`{{"contract_price": "4308000"}}`、`{{"contract_price": "4,308,000"}}`、`{{"contract_price": "￥4308000"}}`
 
 ## 输入
 合同总价条款：
