@@ -1786,7 +1786,39 @@ class PaymentSummaryRatioExtractor:
         """
         if not batch_items or batch_items == '[]':
             return [], None
-        
+
+        # ========================================================================
+        # 临时旁路（保留 LLM 复核代码与 prompt 以备恢复）
+        # 启用方式：环境变量 SERVICE2_BYPASS_PAYMENT_REVIEW=1
+        # 行为：跳过复核 LLM 调用，将 input items 字段直接 passthrough 为输出格式
+        #       （init_ratio → final_ratio, init_amount → final_amount，其它原样）
+        # 恢复方式：取消该环境变量（或设为 0/false）即可走回完整 LLM 复核流程
+        # ========================================================================
+        if os.getenv("SERVICE2_BYPASS_PAYMENT_REVIEW", "").strip().lower() in ("1", "true", "yes"):
+            try:
+                _input_items = json.loads(batch_items)
+            except json.JSONDecodeError:
+                logger.warning(f"[复核旁路] {clause_category} batch_items 解析失败，返回空")
+                return [], None
+            _passthrough_items: List[Dict] = []
+            for _it in _input_items:
+                if not isinstance(_it, dict):
+                    continue
+                _passthrough_items.append({
+                    "id": _it.get("id", ""),
+                    "payment_clause": _it.get("payment_clause", ""),
+                    "payment_type": _it.get("payment_type", ""),
+                    "final_ratio": _it.get("init_ratio"),
+                    "final_amount": _it.get("init_amount"),
+                    "clause_category": clause_category,
+                })
+            logger.warning(
+                f"[复核旁路] SERVICE2_BYPASS_PAYMENT_REVIEW=1 已启用，"
+                f"{clause_category} 跳过 LLM 复核，{len(_passthrough_items)} 条 input items 直接 passthrough"
+            )
+            return _passthrough_items, None
+        # ========================================================================
+
         # 验证输入
         self._validate_batch_payment_items(batch_items, f"{clause_category}支付条款")
         

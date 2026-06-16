@@ -25,6 +25,13 @@ SERVICE1_CONFIG = {
     "timeout": _env("SERVICE1_TIMEOUT", 1200),
 }
 
+# # ===== Service 1（条款分类）=====
+# SERVICE1_CONFIG = {
+#     "base_url": _env("SERVICE1_BASE_URL", "http://10.204.2.21:2339"),
+#     "timeout": _env("SERVICE1_TIMEOUT", 1200),
+# }
+
+
 # ===== Service 2（付款信息提取）=====
 # 两套预设：本地开发 / 百舸远程生产
 SERVICE2_LOCAL_CONFIG = {
@@ -35,10 +42,10 @@ SERVICE2_LOCAL_CONFIG = {
 }
 
 SERVICE2_REMOTE_CONFIG = {
-    "base_url": _env("SERVICE2_REMOTE_BASE_URL", "http://106.13.172.186/s-r644699c4b7c/8000"),
+    "base_url": _env("SERVICE2_REMOTE_BASE_URL", "http://10.204.2.103/s-r644699c4b7c/8000"),
     "endpoint": _env("SERVICE2_ENDPOINT", "/extract_payment_info"),
     # 安全：禁止把生产 API Key 硬编码进源码。请通过环境变量 SERVICE2_API_KEY 注入。
-    "api_key": _env("SERVICE2_API_KEY", ""),
+    "api_key": _env("SERVICE2_API_KEY", "7d9b2e17-2290d95b9773-2e862b5cee2c"),
     "timeout": _env("SERVICE2_TIMEOUT", 600),
 }
 
