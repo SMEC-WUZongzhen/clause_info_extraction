@@ -394,7 +394,7 @@ curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/extract_payment_info \
 | `payment_days` | int/null | 付款天数（correct 分支从提取结果回填，missed/false 为 null） |
 | `latest_payment_stage` | string/null | 最迟付款节点（correct 分支回填） |
 | `latest_payment_date` | int/null | 最迟付款时间-天数（correct 分支回填） |
-| `special_clause_content` | string/null | 特殊条款内容（文档级汇总，统一回填） |
+| `special_clause_content` | string/null | 特殊条款内容（按 clause_category 分类回填对应分组的条款文本） |
 
 **MissedPaymentItem 对象字段**（`missed_payments` 数组元素）:
 
@@ -447,7 +447,7 @@ curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/extract_payment_info \
 | `payment_days` | int/null | 付款天数（自付款触发条件起的常规周期天数） |
 | `latest_payment_stage` | string/null | 最迟付款节点名称（事件/状态描述） |
 | `latest_payment_date` | int/null | 最迟付款时间（截止天数） |
-| `special_clause_content` | string/null | 特殊条款内容（文档内全部付款条款文本汇总） |
+| `special_clause_content` | string/null | 特殊条款内容（按 clause_category 分类汇总的付款条款文本，仅包含同分类条款） |
 
 **WarrantyItem 对象字段**:
 
@@ -965,6 +965,7 @@ F1 = 2 × (精确率 × 召回率) / (精确率 + 召回率)
 
 | 版本 | 日期 | 变更说明 |
 |------|------|----------|
+| **v1.8.3** | 2026-06 | `special_clause_content` 字段由文档级统一汇总改为按 `clause_category` 分类拼装：设备付款节点仅包含设备类条款文本，安装付款节点仅包含安装类条款文本。字段类型不变（`string/null`），对外无破坏性变更。 |
 | **v1.8.2** | 2026-06 | `/compare_contract_price` 的 `sis_contract_price` 改为可选：未传或为 `null` 时仅做 LLM 抽取，不进行比对，响应中 `comparison_result` 返回 `null`、`sis_contract_price` 也回带 `null`。已传值时行为与 v1.8.1 完全一致。 |
 | **v1.8.1** | 2026-06 | **Breaking**: `analyze` 模式请求字段 `gt_payment_stages` 重命名为 `sis_payment_stages`；422 错误信息中的 `loc` 同步更新；其余字段语义、归一化规则与响应结构保持不变。客户端需同步替换字段名，旧字段不再兼容。 |
 | **v1.8.0** | 2026-06 | 新增 `POST /compare_contract_price` 接口：基于 LLM 从合同总价条款抽取金额（提示词 `CONTRACT_PRICE_EXTRACTION_PROMPT` 位于 `app/config/prompts.py`），与 `sis_contract_price` 做硬编码差值比对（阈值固定 `10.0` 元）。新增 Service 层 `app/utils/contract_price_comparator.py`；DTO `ContractPriceCompareRequest` / `ContractPriceCompareResponse` 定义于 `app/api.py`。 |

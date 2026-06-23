@@ -446,15 +446,30 @@ function renderStep2(result) {
     }).join("");
   }
 
-  // 特殊条款内容（文档级汇总，取首条非空）
+  // 特殊条款内容（按 clause_category 分组显示）
   const specialClauseWrap = document.getElementById("special-clause-wrap");
-  const specialClauseEl = document.getElementById("special-clause-content");
-  const scc = paymentItems.find((it) => it.special_clause_content)?.special_clause_content;
-  if (scc && specialClauseWrap && specialClauseEl) {
-    specialClauseEl.textContent = scc;
-    specialClauseWrap.style.display = "block";
-  } else if (specialClauseWrap) {
-    specialClauseWrap.style.display = "none";
+  const equipWrap = document.getElementById("special-clause-equip-wrap");
+  const equipEl = document.getElementById("special-clause-equip");
+  const installWrap = document.getElementById("special-clause-install-wrap");
+  const installEl = document.getElementById("special-clause-install");
+
+  const sccEquip = paymentItems.find(
+    (it) => (it.clause_category || "equipment_payment") === "equipment_payment" && it.special_clause_content
+  )?.special_clause_content;
+  const sccInstall = paymentItems.find(
+    (it) => it.clause_category === "installation_payment" && it.special_clause_content
+  )?.special_clause_content;
+
+  if (equipWrap && equipEl) {
+    if (sccEquip) { equipEl.textContent = sccEquip; equipWrap.style.display = "block"; }
+    else { equipWrap.style.display = "none"; }
+  }
+  if (installWrap && installEl) {
+    if (sccInstall) { installEl.textContent = sccInstall; installWrap.style.display = "block"; }
+    else { installWrap.style.display = "none"; }
+  }
+  if (specialClauseWrap) {
+    specialClauseWrap.style.display = (sccEquip || sccInstall) ? "block" : "none";
   }
 
   // 质保期

@@ -1865,15 +1865,19 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
         progress=EXTRACTOR_STAGE_PROGRESS["payment_timing_extract"],
     )
 
-    # (a) special_clause_content：所有 payment_clause 去重保序拼接
-    _seen_clauses: set = set()
-    _ordered_clauses: List[str] = []
+    # (a) special_clause_content：按 clause_category 分组，各组内 payment_clause 去重保序拼接
+    _category_seen: Dict[str, set] = {"equipment_payment": set(), "installation_payment": set()}
+    _category_clauses: Dict[str, List[str]] = {"equipment_payment": [], "installation_payment": []}
     for _info in final_payment_infos:
         _c = (_info.payment_clause or "").strip()
-        if _c and _c not in _seen_clauses:
-            _seen_clauses.add(_c)
-            _ordered_clauses.append(_c)
-    special_clause_content = "\n".join(_ordered_clauses) if _ordered_clauses else None
+        _cat = _info.clause_category or "equipment_payment"
+        if _c and _c not in _category_seen[_cat]:
+            _category_seen[_cat].add(_c)
+            _category_clauses[_cat].append(_c)
+    special_clause_by_category: Dict[str, Optional[str]] = {
+        cat: "\n".join(clauses) if clauses else None
+        for cat, clauses in _category_clauses.items()
+    }
 
     # (b) 按 (clause, context, category) 唯一键并发调用 LLM 提取时效指标
     timing_extractor = await get_summary_extractor(state.get("llm_config"))
@@ -1922,7 +1926,7 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
                 )
             _info.latest_payment_stage = None
             _info.latest_payment_date = None
-        _info.special_clause_content = special_clause_content
+        _info.special_clause_content = special_clause_by_category.get(_info.clause_category or "equipment_payment")
 
     if _stripped_count:
         logger.info(f"{_NODE_TAG} Stage 7 硬门控共清理 {_stripped_count} 个误抽的 latest_* 字段")

@@ -153,6 +153,15 @@ class ParagraphInput(Paragraph):
     clause: str = Field("", max_length=_MAX_CLAUSE_LEN)
     clause_context: str = Field("", max_length=_MAX_CLAUSE_LEN * 4)
 
+    @field_validator("clause", "clause_context", "clause_class", mode="before")
+    @classmethod
+    def _coerce_none_to_default(cls, v, info):
+        # Service 1 对空值字段会显式传 null；Pydantic 的 str/List 不接受 None
+        # （字段默认值仅在键缺失时生效，显式 null 仍校验失败），此处统一兜底。
+        if v is None:
+            return [] if info.field_name == "clause_class" else ""
+        return v
+
 
 class GroundTruthItem(BaseModel):
     stage: str = Field(..., description="付款节点/阶段名称")
@@ -318,14 +327,14 @@ def _build_extraction_result(final_state: Dict[str, Any]) -> List[Union[PaymentI
 def _map_comparison_payments(
     payments: List[Dict[str, Any]],
     timing_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
-    special_clause_content: Optional[str] = None,
+    special_clause_by_category: Optional[Dict[str, Optional[str]]] = None,
 ) -> List[Dict[str, Any]]:
     """对比对结果列表（correct/missed/false_payments）应用标准节点映射并统一输出字段。
 
     - 应用 payment_type → 标准节点名映射
     - 添加 payment_code（未命中为 null）
     - 4 个新增字段策略：
-        * special_clause_content：文档级聚合字段，对所有列表统一回填（无差异）
+        * special_clause_content：按 clause_category 分类回填对应分组的条款文本
         * payment_days / latest_payment_stage / latest_payment_date：仅 correct_payments
           通过 timing_lookup（按 payment_clause 索引）回填；missed/false 保持 null
     """
@@ -351,17 +360,18 @@ def _map_comparison_payments(
         item["payment_days"] = timing.get("payment_days")
         item["latest_payment_stage"] = timing.get("latest_payment_stage")
         item["latest_payment_date"] = timing.get("latest_payment_date")
-        item["special_clause_content"] = special_clause_content
+        cat = item.get("clause_category") or item.get("category") or "equipment_payment"
+        item["special_clause_content"] = (special_clause_by_category or {}).get(cat)
         result.append(item)
     return result
 
 
 def _build_timing_lookup(
     final_state: Dict[str, Any],
-) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
-    """从 final_state 的 payment_infos 中构建 (payment_clause → timing 字段) 索引和文档级 special_clause_content。"""
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Optional[str]]]:
+    """从 final_state 的 payment_infos 中构建 (payment_clause → timing 字段) 索引和按 category 分组的 special_clause_content。"""
     lookup: Dict[str, Dict[str, Any]] = {}
-    special_clause_content: Optional[str] = None
+    scc_by_category: Dict[str, Optional[str]] = {"equipment_payment": None, "installation_payment": None}
     for info in final_state.get("payment_infos", []) or []:
         info_dict = info.model_dump() if hasattr(info, "model_dump") else (info or {})
         clause_key = (info_dict.get("payment_clause") or "").strip()
@@ -371,12 +381,13 @@ def _build_timing_lookup(
                 "latest_payment_stage": info_dict.get("latest_payment_stage"),
                 "latest_payment_date": info_dict.get("latest_payment_date"),
             }
-        # special_clause_content 是文档级聚合，在 PaymentInfo 上重复存放；取首个非空即可
-        if special_clause_content is None:
+        # special_clause_content 按 clause_category 分组；每个分类取首个非空即可
+        cat = info_dict.get("clause_category") or "equipment_payment"
+        if scc_by_category.get(cat) is None:
             scc = info_dict.get("special_clause_content")
             if scc:
-                special_clause_content = scc
-    return lookup, special_clause_content
+                scc_by_category[cat] = scc
+    return lookup, scc_by_category
 
 
 # =============================================================================
@@ -402,6 +413,8 @@ async def extract_payment_info(
     当 `operation_type='analyze'` 时，额外与 `sis_payment_stages` 进行比对，返回准确率指标。
     """
     logger.info(f"--- 接收到 /extract_payment_info 请求，ID: {request.id}, 模式: {request.operation_type} ---")
+    _ctx_count = sum(1 for p in request.paragraphs if p.clause_context)
+    logger.info(f"接收条款 {len(request.paragraphs)} 条，其中含上下文 {_ctx_count} 条")
 
     # 将 ParagraphInput 转换为 Paragraph 对象
     paragraphs = [
@@ -527,17 +540,17 @@ async def extract_payment_info(
         correct_payments=_map_comparison_payments(
             final_output.get("correct_payments", []),
             timing_lookup=timing_lookup,
-            special_clause_content=scc,
+            special_clause_by_category=scc,
         ),
         missed_payments=_map_comparison_payments(
             final_output.get("missed_payments", []),
             timing_lookup=None,
-            special_clause_content=scc,
+            special_clause_by_category=scc,
         ),
         false_payments=_map_comparison_payments(
             final_output.get("false_payments", []),
             timing_lookup=None,
-            special_clause_content=scc,
+            special_clause_by_category=scc,
         ),
         evaluation_metrics=final_output.get("evaluation_metrics", {}),
     )

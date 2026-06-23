@@ -295,10 +295,19 @@ class PaymentRatioExtractor:
     
     def _extract_json_array_from_text(self, text: str) -> Optional[str]:
         """
-        从混合文本中提取第一个完整的JSON数组片段 [...]。
+        从混合文本中提取 JSON 对象数组片段 [{...}]。
         LLM有时会在JSON前后附带解释性文字，导致直接 json.loads 失败。
+
+        策略：优先搜索最后一个 '[{' 模式（付款节点数组格式），
+        避免被推理文本中的 LaTeX 样式括号（如 $[ 5 ] \\%$）误导。
+        若不存在 '[{' 则回退到第一个 '['。
         """
-        start_idx = text.find('[')
+        # 找最后一个 [ 后跟可选空白再跟 { 的位置（即 JSON 对象数组起始）
+        matches = list(re.finditer(r'\[\s*\{', text))
+        if matches:
+            start_idx = matches[-1].start()
+        else:
+            start_idx = text.find('[')
         if start_idx == -1:
             return None
         bracket_count = 0
@@ -2547,7 +2556,10 @@ class PaymentSummaryRatioExtractor:
                         break
 
             if end_pos == -1:
-                return self._infer_validity_from_text(cleaned, original_clause)
+                # 找到了 '{' 但没有匹配的 '}'（幻觉续写导致括号不闭合）。
+                # 仅取 '{' 之前的前置文本推断，避免幻觉续写中的 '→ false' 干扰。
+                prefix_text = cleaned[:first_brace]
+                return self._infer_validity_from_text(prefix_text, original_clause)
 
             json_str = cleaned[first_brace:end_pos + 1]
 
@@ -2564,6 +2576,18 @@ class PaymentSummaryRatioExtractor:
 
             if not isinstance(parsed_data, dict):
                 return self._infer_validity_from_text(cleaned, original_clause)
+
+            # ID错位守护：LLM可能幻觉续写，输出与输入不匹配的id（如输入id=2但输出id=3）。
+            # 检测到错位时，JSON中的is_valid不可信，回退至前置CoT文本推断。
+            parsed_id = str(parsed_data.get("id", "")).strip()
+            original_id = str(original_clause.get("id", "")).strip()
+            if parsed_id and original_id and parsed_id != original_id:
+                logger.warning(
+                    f"条款校验ID错位: 输入ID={original_id}, LLM输出ID={parsed_id}, "
+                    f"判定为幻觉续写，回退至CoT推断"
+                )
+                prefix_text = cleaned[:first_brace]
+                return self._infer_validity_from_text(prefix_text, original_clause)
 
             return {
                 "id": parsed_data.get("id", original_clause.get("id", "")),
