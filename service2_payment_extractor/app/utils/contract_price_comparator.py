@@ -123,8 +123,13 @@ async def extract_contract_price(
     if not clause:
         return None
 
-    # 健壮处理可空上下文
-    context = (contract_price_clause_context or "").strip() or "（无）"
+    # 健壮处理可空上下文；超长时截断尾部（context 仅辅助理解，不是核心提取对象）
+    _MAX_CONTEXT_CHARS = 4096
+    context = (contract_price_clause_context or "").strip()
+    if len(context) > _MAX_CONTEXT_CHARS:
+        context = context[:_MAX_CONTEXT_CHARS]
+        logger.warning(f"合同金额抽取：上下文过长已截断至 {_MAX_CONTEXT_CHARS} 字符")
+    context = context or "（无）"
 
     llm_cfg = APP_CONFIG.llm
     if not llm_cfg or not llm_cfg.api_base:

@@ -9,7 +9,12 @@ from loguru import logger
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI
-from app.states.states import State, WarrantyInfo, ThinkingInfo
+from app.states.states import (
+    State, WarrantyInfo, ThinkingInfo,
+    PaymentRatioResult, PaymentSummaryResult, WarrantySummaryResult,
+    VerificationResult, ClauseValidationResult, ClauseCategoryResult,
+    SingleGroupVerificationResult, PaymentTimingResult,
+)
 from typing import Optional, List, Union, Tuple, Dict, Any
 from app.config.prompts_loader import (
     PAYMENT_RATIO_PROMPT,
@@ -23,6 +28,8 @@ from app.config.prompts_loader import (
     PAYMENT_CLAUSE_VALIDATION_PROMPT,
     PAYMENT_CLAUSE_CATEGORY_PROMPT,
     PAYMENT_TIMING_EXTRACTION_PROMPT,
+    EQUIPMENT_STANDARD_NODES_STR,
+    INSTALL_STANDARD_NODES_STR,
 )
 from app.config.config import APP_CONFIG
 from app.utils.token_counter import count_tokens
@@ -36,6 +43,17 @@ from pydantic import BaseModel, RootModel, Field
 # ===== LLM 调用默认参数（可由环境变量统一调整，显式配置避免 LangChain 默认值隐患）=====
 _LLM_REQUEST_TIMEOUT_SEC = int(os.getenv("LLM_REQUEST_TIMEOUT_SEC", "60"))
 _LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
+
+
+def _make_json_schema_format(name: str, model: type) -> dict:
+    """生成 SGLang / OpenAI compatible json_schema response_format 字典"""
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": name,
+            "schema": model.model_json_schema(),
+        },
+    }
 
 
 class PaymentRatioExtractor:
@@ -74,8 +92,9 @@ class PaymentRatioExtractor:
             
             equipment_prompt = PromptTemplate.from_template(EQUIPMENT_PAYMENT_RATIO_PROMPT)
             install_prompt = PromptTemplate.from_template(INSTALL_PAYMENT_RATIO_PROMPT)
-            self.equipment_chain = equipment_prompt | self.llm
-            self.install_chain = install_prompt | self.llm
+            _ratio_fmt = _make_json_schema_format("payment_ratio_result", PaymentRatioResult)
+            self.equipment_chain = equipment_prompt | self.llm.bind(response_format=_ratio_fmt)
+            self.install_chain = install_prompt | self.llm.bind(response_format=_ratio_fmt)
             self.chain = self.equipment_chain  # 向后兼容
             self._max_tokens_value = llm_max_tokens  # 供 token 截断逻辑使用
             self.is_ready = True
@@ -224,101 +243,30 @@ class PaymentRatioExtractor:
 
     def _parse_multi_node_response(self, text: str) -> List[Dict[str, Any]]:
         """
-        解析LLM返回的多节点JSON数组响应。
-        
-        支持三级降级：
-        1. 正常解析：JSON数组 → 多个 {payment_type, ratio, amount} dict
-        2. 兼容降级：如果LLM返回单对象（旧格式），包装为长度1的数组
-        3. 正则兜底：复用 _parse_payment_info_from_text() 作为最后手段
-        
-        返回: List[Dict[str, Any]]，每个dict包含 {payment_type, ratio, amount}
-        """
-        if not text or not text.strip() or text.lower() in ['none', 'null', 'n/a', '无', '未知', '不明确']:
-            return []
-        
-        cleaned_text = text.strip()
-        # 移除markdown代码块标记
-        cleaned_text = re.sub(r'^```(?:json)?\s*\n?', '', cleaned_text, flags=re.MULTILINE)
-        cleaned_text = re.sub(r'\n?```\s*$', '', cleaned_text, flags=re.MULTILINE)
-        cleaned_text = cleaned_text.strip()
-        
-        # 尝试1: 直接解析整段文本为JSON
-        json_parsed = self._try_parse_json_nodes(cleaned_text)
-        if json_parsed is not None:
-            return json_parsed
-        
-        # 尝试2: 从混合文本中提取 JSON 数组片段（LLM可能在JSON前后附带解释文字）
-        array_match = self._extract_json_array_from_text(cleaned_text)
-        if array_match:
-            json_parsed = self._try_parse_json_nodes(array_match)
-            if json_parsed is not None:
-                return json_parsed
-        
-        # 尝试3: 正则兜底 — 使用旧的单节点解析器
-        fallback = self._parse_payment_info_from_text(cleaned_text)
-        if fallback.get("ratio") is not None or fallback.get("amount") is not None:
-            # 尝试从原始文本中提取 payment_type
-            if not fallback.get("payment_type"):
-                fallback["payment_type"] = self._extract_payment_type_from_text(cleaned_text)
-            logger.warning("多节点解析失败，使用正则兜底提取到单节点结果")
-            return [fallback]
-        
-        return []
-    
-    def _try_parse_json_nodes(self, text: str) -> Optional[List[Dict[str, Any]]]:
-        """
-        尝试将文本解析为JSON并提取付款节点。
-        成功返回节点列表，失败返回 None。
-        """
-        try:
-            data = json.loads(text)
-            if isinstance(data, list):
-                results = []
-                for item in data:
-                    if not isinstance(item, dict):
-                        continue
-                    node = self._normalize_node_from_json(item)
-                    if node:
-                        results.append(node)
-                if results:
-                    logger.info(f"成功解析多节点响应：识别到 {len(results)} 个付款节点")
-                    return results
-            elif isinstance(data, dict):
-                # 兼容降级：LLM返回了旧的单对象格式
-                node = self._normalize_node_from_json(data)
-                if node:
-                    logger.info("LLM返回单对象格式，兼容包装为数组")
-                    return [node]
-        except (json.JSONDecodeError, ValueError, TypeError) as e:
-            logger.debug(f"JSON解析失败: {e}")
-        return None
-    
-    def _extract_json_array_from_text(self, text: str) -> Optional[str]:
-        """
-        从混合文本中提取 JSON 对象数组片段 [{...}]。
-        LLM有时会在JSON前后附带解释性文字，导致直接 json.loads 失败。
+        解析 LLM 返回的多节点 JSON 响应（json_schema 强制格式）。
 
-        策略：优先搜索最后一个 '[{' 模式（付款节点数组格式），
-        避免被推理文本中的 LaTeX 样式括号（如 $[ 5 ] \\%$）误导。
-        若不存在 '[{' 则回退到第一个 '['。
+        SGLang constrained decoding 保证输出为合法 JSON，格式为：
+            {"nodes": [{payment_type, ratio, amount}, ...]}
+        直接解析后逐节点调用 _normalize_node_from_json 做业务字段规整。
         """
-        # 找最后一个 [ 后跟可选空白再跟 { 的位置（即 JSON 对象数组起始）
-        matches = list(re.finditer(r'\[\s*\{', text))
-        if matches:
-            start_idx = matches[-1].start()
-        else:
-            start_idx = text.find('[')
-        if start_idx == -1:
-            return None
-        bracket_count = 0
-        for i in range(start_idx, len(text)):
-            if text[i] == '[':
-                bracket_count += 1
-            elif text[i] == ']':
-                bracket_count -= 1
-                if bracket_count == 0:
-                    return text[start_idx:i + 1]
-        return None
+        if not text or not text.strip():
+            return []
+        try:
+            data = json.loads(text.strip())
+            nodes = data.get("nodes", []) if isinstance(data, dict) else []
+            results = []
+            for item in nodes:
+                if not isinstance(item, dict):
+                    continue
+                node = self._normalize_node_from_json(item)
+                if node:
+                    results.append(node)
+            if results:
+                logger.info(f"解析多节点响应：识别到 {len(results)} 个付款节点")
+            return results
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            logger.error(f"_parse_multi_node_response JSON 解析失败（schema 约束下不应出现）: {e}")
+            return []
     
     @staticmethod
     def _extract_payment_type_from_text(text: str) -> Optional[str]:
@@ -618,10 +566,16 @@ class PaymentRatioExtractor:
         payment_clause: Optional[str],
         current_clauses_chunk: Optional[str],
     ) -> list:
-        """初次提取兜底：原文不含 % / 付清语义、且上下文也无唯一总价时，强制清空 ratio。
+        """初次提取兜底：原文不含显式比例依据时，强制清空 ratio。
 
-        注：算术校核（金额 == 唯一总价 → 100%）已移至复核结果解析后统一应用，
-        以避免本步结果被复核 LLM 二次覆盖。
+        判断逻辑（按优先级）：
+          1. 原文含显式比例字样（%/％/百分之/百分）→ 放行，ratio 来自原文，可信。
+          2. 原文含余款/余额等隐含剩余语义 且 无显式金额 → 放行，
+             ratio 由前序节点累计推算（如前序已付80%，当前余款=20%），可信。
+          3. 原文含余款语义 但 同时有显式金额 → 强制清空 ratio。
+             原因：有具体金额时 LLM 常幻觉出比例（从 RAG 借用或猜测），
+             金额字段已足够表达支付信息，ratio 的来源不可信。
+          4. 其余情况（仅有金额、无任何比例依据）→ 强制清空 ratio。
         """
         if not payment_nodes:
             return payment_nodes
@@ -630,9 +584,14 @@ class PaymentRatioExtractor:
         _bd_syn = get_business_dict().synonyms
         has_pct_token = any(tok in text for tok in _bd_syn.percent_tokens)
         has_residual = any(tok in text for tok in _bd_syn.residual_tokens)
-        has_unique_total = self._has_unique_total_in_context(current_clauses_chunk)
+        # 检查原文是否含有显式金额（带单位的数字，如 80000元 / 40.46万元 / ¥5000）
+        has_explicit_amount = bool(
+            re.search(r'\d[\d,，.]*\s*(万元|万|元)', text)
+            or re.search(r'[¥￥]\s*\d', text)
+        )
 
-        if has_pct_token or has_residual or has_unique_total:
+        # 放行条件：有显式 % 或（有余款语义 且 无显式金额）
+        if has_pct_token or (has_residual and not has_explicit_amount):
             return payment_nodes
 
         for node in payment_nodes:
@@ -641,11 +600,10 @@ class PaymentRatioExtractor:
                 continue
             preview = text.strip().replace("\n", " ")[:60]
             logger.warning(
-                f"原文无比例字样且不满足反算条件，强制清空 ratio: 原ratio={ratio_val}, "
+                f"原文无比例字样且无余款语义，强制清空 ratio: 原ratio={ratio_val}, "
                 f"原条款={preview}..."
             )
             node["ratio"] = None
-        return payment_nodes
         return payment_nodes
 
     # 为了向后兼容，保留原有的extract_ratio方法
@@ -759,21 +717,29 @@ class PaymentSummaryRatioExtractor:
             result_verification_prompt_template = PromptTemplate(template=RESULT_VERIFICATION_PROMPT, input_variables=["validation_equipment", "validation_install"])
             clause_validation_prompt_template = PromptTemplate(template=PAYMENT_CLAUSE_VALIDATION_PROMPT, input_variables=["validation_clauses"])
             clause_category_prompt_template = PromptTemplate(template=PAYMENT_CLAUSE_CATEGORY_PROMPT, input_variables=["category_clause"])
-            result_verification_single_group_prompt_template = PromptTemplate(template=RESULT_VERIFICATION_SINGLE_GROUP_PROMPT, input_variables=["group_clauses"])
+            result_verification_single_group_prompt_template = PromptTemplate(template=RESULT_VERIFICATION_SINGLE_GROUP_PROMPT, input_variables=["group_clauses", "standard_nodes"])
             payment_timing_prompt_template = PromptTemplate(
                 template=PAYMENT_TIMING_EXTRACTION_PROMPT,
                 input_variables=["payment_clause", "payment_context", "clause_category", "standard_nodes"],
             )
 
-            # 【重要】我们不再链接脆弱的JsonOutputParser，而是手动解析
-            self.llm_chain = prompt_template | llm
-            self.install_llm_chain = install_prompt_template | llm
-            self.warranty_llm_chain = warranty_prompt_template | llm
-            self.result_verification_llm_chain = result_verification_prompt_template | llm
-            self.clause_validation_llm_chain = clause_validation_prompt_template | llm
-            self.clause_category_llm_chain = clause_category_prompt_template | llm
-            self.result_verification_single_group_llm_chain = result_verification_single_group_prompt_template | llm
-            self.payment_timing_llm_chain = payment_timing_prompt_template | llm
+            # 【重要】使用 json_schema response_format 强制结构化输出，消除 fallback 解析
+            _summary_fmt    = _make_json_schema_format("payment_summary_result",     PaymentSummaryResult)
+            _warranty_fmt   = _make_json_schema_format("warranty_summary_result",    WarrantySummaryResult)
+            _verify_fmt     = _make_json_schema_format("verification_result",        VerificationResult)
+            _val_fmt        = _make_json_schema_format("clause_validation_result",   ClauseValidationResult)
+            _cat_fmt        = _make_json_schema_format("clause_category_result",     ClauseCategoryResult)
+            _sg_fmt         = _make_json_schema_format("single_group_verification",  SingleGroupVerificationResult)
+            _timing_fmt     = _make_json_schema_format("payment_timing_result",      PaymentTimingResult)
+
+            self.llm_chain = prompt_template | llm.bind(response_format=_summary_fmt)
+            self.install_llm_chain = install_prompt_template | llm.bind(response_format=_summary_fmt)
+            self.warranty_llm_chain = warranty_prompt_template | llm.bind(response_format=_warranty_fmt)
+            self.result_verification_llm_chain = result_verification_prompt_template | llm.bind(response_format=_verify_fmt)
+            self.clause_validation_llm_chain = clause_validation_prompt_template | llm.bind(response_format=_val_fmt)
+            self.clause_category_llm_chain = clause_category_prompt_template | llm.bind(response_format=_cat_fmt)
+            self.result_verification_single_group_llm_chain = result_verification_single_group_prompt_template | llm.bind(response_format=_sg_fmt)
+            self.payment_timing_llm_chain = payment_timing_prompt_template | llm.bind(response_format=_timing_fmt)
 
             # 记录最终生效的 LLM 配置（用于 _should_reinitialize 比对）
             self.current_llm_config = {
@@ -788,889 +754,43 @@ class PaymentSummaryRatioExtractor:
         except Exception as e:
             logger.opt(exception=True).error("初始化 PaymentSummaryRatioExtractor 失败: {err}", err=str(e))
             self.is_ready = False
-    
-    def _clean_json_string(self, json_str: str) -> str:
-        """
-        清理JSON字符串中的控制字符和换行符，使其能够正确解析。
-        支持处理markdown代码块格式（```json ... ```）。
-        """
-        import re
-        
-        # 首先处理markdown代码块标记
-        cleaned = json_str.strip()
-        
-        # 方法1: 尝试移除markdown代码块标记
-        # 匹配开头的 ```json 或 ```（可能前后有空白字符）
-        cleaned = re.sub(r'^```(?:json)?\s*\n?', '', cleaned, flags=re.MULTILINE)
-        # 匹配结尾的 ```（可能前后有空白字符）
-        cleaned = re.sub(r'\n?```\s*$', '', cleaned, flags=re.MULTILINE)
-        
-        # 方法2: 如果还有markdown标记，尝试提取JSON内容
-        # 查找第一个 [ 或 { 作为JSON开始，然后找到匹配的结束符
-        if '```' in cleaned:
-            # 查找第一个 [ 或 {
-            start_idx = -1
-            for i, char in enumerate(cleaned):
-                if char in ['[', '{']:
-                    start_idx = i
-                    break
-            
-            if start_idx >= 0:
-                # 从开始位置查找匹配的结束符，处理嵌套结构
-                bracket_stack = []
-                end_idx = -1
-                in_string = False
-                escape_next = False
-                
-                for i in range(start_idx, len(cleaned)):
-                    char = cleaned[i]
-                    
-                    # 处理转义字符
-                    if escape_next:
-                        escape_next = False
-                        continue
-                    if char == '\\':
-                        escape_next = True
-                        continue
-                    
-                    # 处理字符串内的字符（不处理括号匹配）
-                    if char == '"' and not escape_next:
-                        in_string = not in_string
-                        continue
-                    
-                    if in_string:
-                        continue
-                    
-                    # 处理括号匹配
-                    if char == '[':
-                        bracket_stack.append('[')
-                    elif char == ']':
-                        if bracket_stack and bracket_stack[-1] == '[':
-                            bracket_stack.pop()
-                            if not bracket_stack:
-                                end_idx = i + 1
-                                break
-                    elif char == '{':
-                        bracket_stack.append('{')
-                    elif char == '}':
-                        if bracket_stack and bracket_stack[-1] == '{':
-                            bracket_stack.pop()
-                            if not bracket_stack:
-                                end_idx = i + 1
-                                break
-                
-                if end_idx > start_idx:
-                    cleaned = cleaned[start_idx:end_idx]
-        
-        # 移除控制字符（除了必要的空格和制表符）
-        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', cleaned)
-        
-        # 将字符串中的换行符替换为空格，但保持JSON结构
-        # 注意：这里需要小心处理，不能破坏JSON的引号结构
-        lines = cleaned.split('\n')
-        result_lines = []
-        
-        for line in lines:
-            line = line.strip()
-            if line:
-                result_lines.append(line)
-        
-        # 重新组合，确保JSON格式正确
-        cleaned_json = ' '.join(result_lines)
-        
-        # 进一步清理：移除多余的空格，但保持JSON结构
-        cleaned_json = re.sub(r'\s+', ' ', cleaned_json)
-        
-        return cleaned_json.strip()
 
     def _parse_llm_output(self, llm_output_str: str) -> Tuple[List[Dict], Optional[Dict], Optional[str]]:
         """
-        一个健壮的解析器，用于从可能包含thinking/result标签的LLM输出中分离出
-        支付条款列表、质保期对象和思考过程字符串。
+        解析 LLM 结构化输出（json_schema 强制格式）。
+
+        Chain 3/4 (PaymentSummaryResult):  {"items": [{id, payment_clause, ...}], "thinking_output": "..."}
+        Chain 5  (WarrantySummaryResult):  {"items": [{warranty, effective_conditions, ...}], "thinking_output": "..."}
+        Chain 6  (VerificationResult):     {"items": [{select_clause_id}], "thinking_output": "..."}
+
+        返回: (payment_items, warranty_info, thinking_output)
         """
-        payment_items, warranty_info, thinking_output = [], None, None
-
-        # 1. 提取思考过程 (优先从 <thinking> 标签)
-        thinking_match = re.search(r'<thinking>(.*?)</thinking>', llm_output_str, re.DOTALL)
-        if thinking_match:
-            thinking_output = thinking_match.group(1).strip()
-            logger.info("成功从 <thinking> 标签中提取到思考过程。")
-
-        # 2. 改进的JSON提取逻辑
-        json_str = None
-        
-        # 方法1: 尝试直接解析整个输出
+        payment_items: List[Dict] = []
+        warranty_info: Optional[Dict] = None
+        thinking_output: Optional[str] = None
         try:
-            data = json.loads(llm_output_str)
-            if isinstance(data, list):
-                json_str = llm_output_str
-            elif isinstance(data, dict) and "clauses" in data:
-                # 如果是对象格式，提取clauses数组
-                json_str = json.dumps(data.get("clauses", []))
-        except json.JSONDecodeError:
-            pass
-        
-        # 方法2: 从 <result> 标签中提取
-        if not json_str:
-            result_match = re.search(r'<result>(.*?)</result>', llm_output_str, re.DOTALL)
-            if result_match:
-                json_str = result_match.group(1).strip()
-                try:
-                    data = json.loads(json_str)
-                    if isinstance(data, dict) and "clauses" in data:
-                        json_str = json.dumps(data.get("clauses", []))
-                except json.JSONDecodeError:
-                    json_str = None
-        
-        # 方法3: 从代码块中提取
-        if not json_str:
-            json_match = re.search(r'```json\s*\n(.*?)\n```', llm_output_str, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(1).strip()
-                try:
-                    data = json.loads(json_str)
-                    if isinstance(data, dict) and "clauses" in data:
-                        json_str = json.dumps(data.get("clauses", []))
-                except json.JSONDecodeError:
-                    json_str = None
-        
-        # 方法4: 提取第一个完整的JSON数组（通过括号匹配）
-        if not json_str:
-            # 找到第一个 '[' 的位置
-            start_idx = llm_output_str.find('[')
-            if start_idx != -1:
-                bracket_count = 0
-                end_idx = start_idx
-                for i, char in enumerate(llm_output_str[start_idx:], start_idx):
-                    if char == '[':
-                        bracket_count += 1
-                    elif char == ']':
-                        bracket_count -= 1
-                        if bracket_count == 0:
-                            end_idx = i + 1
-                            break
-                
-                if bracket_count == 0:
-                    json_str = llm_output_str[start_idx:end_idx].strip()
-                    logger.debug(f"通过括号匹配提取到JSON数组，长度: {len(json_str)}")
-        
-        # 方法5: 最后的回退策略 - 查找第一个完整的JSON对象
-        if not json_str:
-            start_idx = llm_output_str.find('{')
-            if start_idx != -1:
-                brace_count = 0
-                end_idx = start_idx
-                for i, char in enumerate(llm_output_str[start_idx:], start_idx):
-                    if char == '{':
-                        brace_count += 1
-                    elif char == '}':
-                        brace_count -= 1
-                        if brace_count == 0:
-                            end_idx = i + 1
-                            break
-                
-                if brace_count == 0:
-                    json_str = llm_output_str[start_idx:end_idx]
-                    try:
-                        data = json.loads(json_str)
-                        if isinstance(data, dict) and "clauses" in data:
-                            json_str = json.dumps(data.get("clauses", []))
-                    except json.JSONDecodeError:
-                        json_str = None
-
-        if not json_str:
-            logger.error("在LLM输出中未能找到有效的JSON数组。")
-            return [], None, thinking_output
-
-        # 清理JSON字符串中的控制字符和修复payment_clause字段中的JSON对象
-        cleaned_json_str = self._clean_json_string(json_str)
-        logger.debug(f"清理后的JSON字符串: {cleaned_json_str[:500]}...")  # 只显示前500字符
-        
-        # 检测并修复可能存在的重复JSON数组（在payment_clause字段中）
-        cleaned_json_str = self._fix_duplicate_json_arrays(cleaned_json_str)
-        
-        # 修复缺失的逗号（在JSON数组中的对象之间）
-        cleaned_json_str = self._fix_missing_commas(cleaned_json_str)
-
-        # 去除悬挂逗号，如 `", }"` / `", ]"`，常见于 Qwen 小模型输出
-        cleaned_json_str = self._fix_trailing_commas(cleaned_json_str)
-
-        # 尝试预验证JSON格式，提前发现问题
-        try:
-            json.loads(cleaned_json_str)
-            logger.debug("JSON格式预验证通过")
-        except json.JSONDecodeError as pre_check_error:
-            logger.warning(f"JSON格式预验证失败: {pre_check_error}，将在正式解析时尝试修复")
-
-        try:
-            data_array = json.loads(cleaned_json_str)
-            # 使用统一的方法处理解析后的数组
-            return self._process_parsed_array(data_array, thinking_output)
-
-        except json.JSONDecodeError as e:
-            error_msg = str(e)
-            error_pos = getattr(e, 'pos', None)
-            
-            # 提取错误位置信息
-            if error_pos is not None:
-                logger.error(f"解析提取出的JSON字符串时失败: {error_msg}")
-                logger.error(f"错误位置: 字符 {error_pos} (行 {cleaned_json_str[:error_pos].count(chr(10)) + 1})")
-                
-                # 显示错误位置的上下文
-                context_start = max(0, error_pos - 50)
-                context_end = min(len(cleaned_json_str), error_pos + 50)
-                context = cleaned_json_str[context_start:context_end]
-                logger.error(f"错误上下文: ...{context}...")
-                logger.error(f"错误位置标记: {' ' * (error_pos - context_start)}^")
-            else:
-                logger.error(f"解析提取出的JSON字符串时失败: {error_msg}")
-            
-            logger.warning("尝试多种修复策略...")
-            
-            # 修复策略1: 修复thinking_output字段中的嵌套JSON
-            try:
-                fixed_json_str = self._fix_nested_json_in_string(cleaned_json_str)
-                if fixed_json_str != cleaned_json_str:
-                    logger.info("策略1: 成功修复thinking_output字段中的嵌套JSON，重新尝试解析...")
-                    data_array = json.loads(fixed_json_str)
-                    return self._process_parsed_array(data_array, thinking_output)
-            except json.JSONDecodeError:
-                logger.debug("策略1失败，尝试策略2...")
-            except Exception as fix_error:
-                logger.warning(f"策略1执行时发生错误: {fix_error}")
-            
-            # 修复策略2: 尝试修复更多缺失的逗号（更激进的修复）
-            try:
-                fixed_json_str = self._fix_missing_commas_aggressive(cleaned_json_str)
-                if fixed_json_str != cleaned_json_str:
-                    logger.info("策略2: 使用更激进的逗号修复策略，重新尝试解析...")
-                    data_array = json.loads(fixed_json_str)
-                    return self._process_parsed_array(data_array, thinking_output)
-            except json.JSONDecodeError:
-                logger.debug("策略2失败，尝试策略3...")
-            except Exception as fix_error:
-                logger.warning(f"策略2执行时发生错误: {fix_error}")
-            
-            # 修复策略3: 尝试移除可能导致问题的特殊字符
-            try:
-                fixed_json_str = self._fix_special_characters(cleaned_json_str)
-                if fixed_json_str != cleaned_json_str:
-                    logger.info("策略3: 修复特殊字符，重新尝试解析...")
-                    data_array = json.loads(fixed_json_str)
-                    return self._process_parsed_array(data_array, thinking_output)
-            except json.JSONDecodeError:
-                logger.debug("策略3失败")
-            except Exception as fix_error:
-                logger.warning(f"策略3执行时发生错误: {fix_error}")
-
-            # 修复策略4: 逐对象抢救 —— 数组整体解析失败时，扫描出所有顶层 { ... } 子串
-            # 逐个 json.loads，跳过失败的对象，保住其余有效条款。
-            try:
-                salvaged = self._salvage_objects(cleaned_json_str)
-                if salvaged:
-                    logger.info(f"策略4: 逐对象抢救成功，共救回 {len(salvaged)} 个对象")
-                    return self._process_parsed_array(salvaged, thinking_output)
-            except Exception as fix_error:
-                logger.warning(f"策略4执行时发生错误: {fix_error}")
-
-            logger.error(f"所有修复策略均失败。待解析的字符串前500字符: {cleaned_json_str[:500]}...")
-            if error_pos:
-                logger.error(f"完整错误位置附近的文本: {cleaned_json_str[max(0, error_pos-100):min(len(cleaned_json_str), error_pos+100)]}")
-            return [], None, thinking_output
-    
-    def _process_parsed_array(self, data_array: Any, existing_thinking: Optional[str]) -> Tuple[List[Dict], Optional[Dict], Optional[str]]:
-        """
-        处理已解析的数组数据，提取支付条款、质保期和思考过程。
-        
-        Args:
-            data_array: 解析后的数组数据
-            existing_thinking: 已存在的思考过程文本
-        
-        Returns:
-            (支付条款列表, 质保期信息, 思考过程文本)
-        """
-        payment_items = []
-        warranty_info = None
-        thinking_output = existing_thinking
-        
-        if not isinstance(data_array, list):
-            if isinstance(data_array, dict):
-                logger.warning(f"解析出的JSON是一个字典而不是列表，尝试将其转换为列表。")
-                if "payment_clause" in data_array or "id" in data_array:
-                    data_array = [data_array]
-                elif "warranty" in data_array:
-                    data_array = [data_array]
-                else:
-                    logger.warning(f"无法识别的字典结构，返回空列表。字典键: {list(data_array.keys())}")
-                    return [], None, thinking_output
-            else:
-                logger.warning(f"解析出的JSON不是列表或字典，而是 {type(data_array)}。")
-                return [], None, thinking_output
-        
-        # 遍历解析出的数组，分离不同类型的对象
-        for idx, item in enumerate(data_array):
-            if not isinstance(item, dict):
-                logger.warning(f"数组第{idx}个元素不是字典类型: {type(item)}")
-                continue
-            
-            try:
-                if 'error' in item:
-                    logger.warning(f"LLM返回包含错误信息: {item.get('error')}")
+            data = json.loads(llm_output_str.strip())
+            items = data.get("items", []) if isinstance(data, dict) else []
+            thinking_output = data.get("thinking_output") if isinstance(data, dict) else None
+            for item in items:
+                if not isinstance(item, dict):
                     continue
-                
                 if "payment_clause" in item and "id" in item:
-                    item = self._fix_payment_clause_json_objects(item)
                     if "final_amount" in item and item["final_amount"] is not None:
                         item["final_amount"] = str(item["final_amount"])
                     payment_items.append(item)
                 elif "warranty" in item:
                     warranty_info = item
-                elif "thinking_output" in item and not thinking_output:
-                    raw_thinking = item.get("thinking_output")
-                    thinking_output = self._fix_thinking_output_json(raw_thinking)
-            except (KeyError, TypeError) as e:
-                logger.error(f"处理数组第{idx}个元素时发生错误: {e}, item类型: {type(item)}, item内容: {str(item)[:200] if item else 'None'}", exc_info=True)
-                continue
-        
-        logger.success(f"成功解析出 {len(payment_items)} 个支付条款, "
-                      f"质保期: {'有' if warranty_info else '无'}, "
-                      f"思考过程: {'有' if thinking_output else '无'}")
-        
+                elif "select_clause_id" in item:
+                    payment_items.append(item)
+            logger.success(
+                f"解析出 {len(payment_items)} 个条款, "
+                f"质保期: {'有' if warranty_info else '无'}, "
+                f"思考: {'有' if thinking_output else '无'}"
+            )
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            logger.error(f"_parse_llm_output JSON 解析失败（schema 约束下不应出现）: {e}")
         return payment_items, warranty_info, thinking_output
-
-    def _fix_nested_json_in_string(self, json_str: str) -> str:
-        """
-        修复JSON字符串中thinking_output字段内的嵌套JSON结构。
-        如果thinking_output的值是一个JSON数组或对象字符串，将其转换为转义的字符串。
-        """
-        try:
-            # 使用正则表达式查找thinking_output字段中的嵌套JSON
-            # 匹配: "thinking_output": "[ {...}, {...} ]" 或 "thinking_output": "{ ... }"
-            pattern = r'"thinking_output"\s*:\s*"(\[(?:[^"\\]|\\.|"\[|"\{)*\])"'
-            
-            def replace_nested_json(match):
-                nested_json = match.group(1)
-                # 将嵌套的JSON字符串转义
-                escaped = json.dumps(nested_json)
-                return f'"thinking_output": {escaped}'
-            
-            fixed_str = re.sub(pattern, replace_nested_json, json_str, flags=re.DOTALL)
-            
-            # 如果替换成功，返回修复后的字符串
-            if fixed_str != json_str:
-                logger.info("检测到并修复了thinking_output字段中的嵌套JSON")
-                return fixed_str
-            
-            # 尝试另一种模式：thinking_output后面直接跟着JSON数组
-            pattern2 = r'"thinking_output"\s*:\s*(\[[\s\S]*?\])(?=\s*[,}])'
-            def replace_nested_json2(match):
-                nested_json = match.group(1)
-                # 尝试解析嵌套JSON，如果成功则转义为字符串
-                try:
-                    json.loads(nested_json)  # 验证是否为有效JSON
-                    escaped = json.dumps(nested_json)
-                    return f'"thinking_output": {escaped}'
-                except:
-                    return match.group(0)  # 如果无法解析，保持原样
-            
-            fixed_str2 = re.sub(pattern2, replace_nested_json2, json_str, flags=re.DOTALL)
-            if fixed_str2 != json_str:
-                logger.info("使用第二种模式修复了thinking_output字段中的嵌套JSON")
-                return fixed_str2
-            
-            return json_str
-        except Exception as e:
-            logger.warning(f"修复嵌套JSON时发生错误: {e}")
-            return json_str
-
-    def _fix_thinking_output_json(self, thinking_text: Any) -> Optional[str]:
-        """
-        修复thinking_output字段中可能包含的嵌套JSON结构。
-        如果thinking_output包含JSON数组或对象，尝试提取其中的文本内容，或将其转换为纯文本。
-        """
-        if not thinking_text:
-            return None
-        
-        if not isinstance(thinking_text, str):
-            thinking_text = str(thinking_text)
-        
-        # 检查是否包含JSON数组结构 [ {...}, {...} ]
-        if thinking_text.strip().startswith('[') and '{"' in thinking_text:
-            logger.warning("检测到thinking_output中包含嵌套的JSON数组，尝试提取文本内容...")
-            try:
-                # 尝试解析JSON数组
-                parsed = json.loads(thinking_text)
-                if isinstance(parsed, list):
-                    # 提取所有对象的文本内容
-                    text_parts = []
-                    for obj in parsed:
-                        if isinstance(obj, dict):
-                            # 提取字典中的值，排除键名
-                            for key, value in obj.items():
-                                if isinstance(value, str) and key != "thinking_output":
-                                    text_parts.append(f"{key}: {value}")
-                                elif key == "thinking_output" and isinstance(value, str):
-                                    # 递归处理嵌套的thinking_output
-                                    nested_text = self._fix_thinking_output_json(value)
-                                    if nested_text:
-                                        text_parts.append(nested_text)
-                    if text_parts:
-                        cleaned_text = "\n".join(text_parts)
-                        logger.info(f"成功从嵌套JSON中提取思考过程文本，长度: {len(cleaned_text)} 字符")
-                        return cleaned_text
-            except json.JSONDecodeError:
-                # 如果解析失败，尝试提取第一个有效的JSON对象之前的内容
-                pass
-        
-        # 检查是否包含JSON对象结构 { "key": "value" }
-        if thinking_text.strip().startswith('{') and '"' in thinking_text:
-            # 尝试提取JSON对象中的文本值
-            try:
-                parsed = json.loads(thinking_text)
-                if isinstance(parsed, dict):
-                    # 提取所有字符串值
-                    text_parts = []
-                    for key, value in parsed.items():
-                        if isinstance(value, str):
-                            text_parts.append(value)
-                        elif isinstance(value, (list, dict)):
-                            # 递归处理嵌套结构
-                            text_parts.append(str(value))
-                    if text_parts:
-                        cleaned_text = "\n".join(text_parts)
-                        logger.info(f"成功从JSON对象中提取思考过程文本，长度: {len(cleaned_text)} 字符")
-                        return cleaned_text
-            except json.JSONDecodeError:
-                pass
-        
-        # 如果包含JSON结构但无法解析，尝试移除JSON标记
-        # 移除 [ { ... } ] 这样的结构
-        cleaned = re.sub(r'\[\s*\{[^}]*\}\s*(?:,\s*\{[^}]*\}\s*)*\]', '', thinking_text)
-        # 移除 { "key": "value" } 这样的结构
-        cleaned = re.sub(r'\{\s*"[^"]*"\s*:\s*"[^"]*"\s*\}', '', cleaned)
-        
-        if cleaned != thinking_text:
-            logger.warning("移除了thinking_output中的JSON结构标记")
-            return cleaned.strip() if cleaned.strip() else thinking_text
-        
-        # 如果无法修复，返回原始文本
-        return thinking_text.strip() if thinking_text.strip() else None
-
-    def _fix_duplicate_json_arrays(self, json_str: str) -> str:
-        """
-        检测并修复JSON字符串中可能存在的重复JSON数组。
-        如果检测到重复的数组结构（例如：整个数组被重复输出），只保留第一个完整的数组。
-        """
-        if not json_str or not isinstance(json_str, str):
-            return json_str
-        
-        # 检测是否有重复的数组开始标记（在字符串中间出现第二个 '['）
-        first_bracket_idx = json_str.find('[')
-        if first_bracket_idx == -1:
-            return json_str
-        
-        # 找到第一个完整数组的结束位置
-        bracket_count = 0
-        first_array_end = -1
-        for i, char in enumerate(json_str[first_bracket_idx:], first_bracket_idx):
-            if char == '[':
-                bracket_count += 1
-            elif char == ']':
-                bracket_count -= 1
-                if bracket_count == 0:
-                    first_array_end = i + 1
-                    break
-        
-        if first_array_end == -1:
-            return json_str
-        
-        # 检查第一个数组之后是否还有另一个数组开始标记
-        remaining_str = json_str[first_array_end:].strip()
-        if remaining_str and remaining_str.startswith('['):
-            logger.warning("检测到JSON字符串中包含重复的数组，将只保留第一个完整的数组")
-            # 只保留第一个完整的数组
-            return json_str[:first_array_end].strip()
-        
-        return json_str
-
-    def _fix_trailing_commas(self, json_str: str) -> str:
-        """
-        移除 JSON 中的悬挂逗号（trailing commas），例如:
-          {"a": 1, }   -> {"a": 1}
-          [1, 2, 3, ]  -> [1, 2, 3]
-        仅在字符串字面量之外替换，字符串内的 ", }" 不会被误伤。
-        """
-        if not json_str or not isinstance(json_str, str):
-            return json_str
-        try:
-            out = []
-            in_string = False
-            escape_next = False
-            n = len(json_str)
-            i = 0
-            fixed_count = 0
-            while i < n:
-                ch = json_str[i]
-                if escape_next:
-                    out.append(ch)
-                    escape_next = False
-                    i += 1
-                    continue
-                if ch == '\\':
-                    out.append(ch)
-                    escape_next = True
-                    i += 1
-                    continue
-                if ch == '"':
-                    in_string = not in_string
-                    out.append(ch)
-                    i += 1
-                    continue
-                if (not in_string) and ch == ',':
-                    # 向后跳过空白，看下一个非空白字符是否是 } 或 ]
-                    j = i + 1
-                    while j < n and json_str[j] in ' \t\r\n':
-                        j += 1
-                    if j < n and json_str[j] in '}]':
-                        # 丢弃该逗号
-                        fixed_count += 1
-                        i += 1
-                        continue
-                out.append(ch)
-                i += 1
-            if fixed_count > 0:
-                logger.info(f"去除悬挂逗号 {fixed_count} 处")
-            return ''.join(out)
-        except Exception as e:
-            logger.warning(f"去除悬挂逗号时出错，保留原文: {e}")
-            return json_str
-
-    def _salvage_objects(self, json_str: str) -> List[Dict[str, Any]]:
-        """
-        从一段可能不合法的 JSON 文本中逐个抢救顶层对象。
-        扫描出每一对匹配的 `{...}`，各自 json.loads；失败的丢弃。
-        用于当整体数组解析失败（如某个尾部对象坏掉）时，不牺牲其余有效条款。
-        """
-        results: List[Dict[str, Any]] = []
-        if not json_str or not isinstance(json_str, str):
-            return results
-        n = len(json_str)
-        i = 0
-        in_string = False
-        escape_next = False
-        depth = 0
-        start = -1
-        while i < n:
-            ch = json_str[i]
-            if escape_next:
-                escape_next = False
-                i += 1
-                continue
-            if ch == '\\':
-                escape_next = True
-                i += 1
-                continue
-            if ch == '"':
-                in_string = not in_string
-                i += 1
-                continue
-            if in_string:
-                i += 1
-                continue
-            if ch == '{':
-                if depth == 0:
-                    start = i
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0 and start != -1:
-                    candidate = json_str[start:i + 1]
-                    # 先做一次轻量修复：去悬挂逗号
-                    candidate_fixed = self._fix_trailing_commas(candidate)
-                    try:
-                        obj = json.loads(candidate_fixed)
-                        if isinstance(obj, dict):
-                            results.append(obj)
-                    except Exception:
-                        # 忽略单个对象解析失败，继续扫描
-                        pass
-                    start = -1
-            i += 1
-        return results
-
-    def _fix_missing_commas(self, json_str: str) -> str:
-        """
-        修复JSON数组中对象之间缺失的逗号。
-        例如: [ {...} {...} ] -> [ {...}, {...} ]
-        支持多种边界情况：
-        - } { 之间缺少逗号
-        - }] { 之间缺少逗号（对象后直接跟数组结束）
-        - 嵌套对象之间的逗号缺失
-        """
-        if not json_str or not isinstance(json_str, str):
-            return json_str
-        
-        # 找到数组的开始和结束位置
-        start_idx = json_str.find('[')
-        if start_idx == -1:
-            return json_str
-        
-        # 找到第一个完整数组的结束位置（处理嵌套数组）
-        bracket_count = 0
-        end_idx = start_idx
-        in_string = False
-        escape_next = False
-        
-        for i in range(start_idx, len(json_str)):
-            char = json_str[i]
-            
-            if escape_next:
-                escape_next = False
-                continue
-            
-            if char == '\\':
-                escape_next = True
-                continue
-            
-            if char == '"':
-                in_string = not in_string
-                continue
-            
-            if not in_string:
-                if char == '[':
-                    bracket_count += 1
-                elif char == ']':
-                    bracket_count -= 1
-                    if bracket_count == 0:
-                        end_idx = i + 1
-                        break
-        
-        if bracket_count != 0:
-            logger.warning("无法找到完整的JSON数组边界，跳过逗号修复")
-            return json_str
-        
-        # 只在数组内部进行修复
-        array_content = json_str[start_idx+1:end_idx-1]
-        
-        # 逐字符检查，跟踪是否在字符串内、对象内、数组内
-        result = []
-        in_string = False
-        escape_next = False
-        brace_depth = 0  # 跟踪对象嵌套深度
-        bracket_depth = 0  # 跟踪数组嵌套深度
-        i = 0
-        fixes_applied = 0
-        
-        while i < len(array_content):
-            char = array_content[i]
-            
-            if escape_next:
-                result.append(char)
-                escape_next = False
-                i += 1
-                continue
-            
-            if char == '\\':
-                result.append(char)
-                escape_next = True
-                i += 1
-                continue
-            
-            if char == '"':
-                in_string = not in_string
-                result.append(char)
-                i += 1
-                continue
-            
-            # 如果不在字符串内，检查结构字符
-            if not in_string:
-                if char == '{':
-                    brace_depth += 1
-                    result.append(char)
-                    i += 1
-                    continue
-                elif char == '}':
-                    brace_depth -= 1
-                    result.append(char)
-                    
-                    # 检查后面是否需要添加逗号
-                    j = i + 1
-                    # 跳过空白字符
-                    while j < len(array_content) and array_content[j] in ' \t\n\r':
-                        j += 1
-                    
-                    # 如果下一个非空白字符是 { 或 [，说明缺少逗号
-                    if j < len(array_content) and array_content[j] in '{[':
-                        result.append(',')
-                        fixes_applied += 1
-                        logger.debug(f"在位置 {start_idx + i + 1} 处检测到缺失的逗号（对象后跟 {array_content[j]}），已修复")
-                    
-                    i += 1
-                    continue
-                elif char == '[':
-                    bracket_depth += 1
-                    result.append(char)
-                    i += 1
-                    continue
-                elif char == ']':
-                    bracket_depth -= 1
-                    result.append(char)
-                    i += 1
-                    continue
-                elif char == ',':
-                    # 检查是否有重复的逗号
-                    j = i + 1
-                    while j < len(array_content) and array_content[j] in ' \t\n\r':
-                        j += 1
-                    if j < len(array_content) and array_content[j] == ',':
-                        # 跳过重复的逗号
-                        logger.debug(f"在位置 {start_idx + i + 1} 处检测到重复的逗号，已移除")
-                        i += 1
-                        continue
-            
-            result.append(char)
-            i += 1
-        
-        # 重新组合字符串
-        fixed_array = '[' + ''.join(result) + ']'
-        fixed_json_str = json_str[:start_idx] + fixed_array + json_str[end_idx:]
-        
-        if fixes_applied > 0:
-            logger.info(f"检测到并修复了 {fixes_applied} 处JSON数组中缺失的逗号")
-        
-        return fixed_json_str
-
-    def _fix_missing_commas_aggressive(self, json_str: str) -> str:
-        """
-        更激进的逗号修复策略，用于处理标准方法无法修复的情况。
-        包括：
-        - 修复对象和数组之间的逗号
-        - 修复字符串值后的逗号缺失
-        - 处理更复杂的嵌套情况
-        """
-        if not json_str or not isinstance(json_str, str):
-            return json_str
-        
-        # 先使用标准方法修复
-        fixed = self._fix_missing_commas(json_str)
-        
-        # 如果标准方法已经修复，直接返回
-        if fixed != json_str:
-            return fixed
-        
-        # 更激进的修复：使用正则表达式查找更多模式
-        # 注意：这种方法可能误修复，需要谨慎使用
-        
-        # 模式1: } 后直接跟 { 或 [（中间可能有空白）
-        pattern1 = r'\}\s+(\{|\[)'
-        if re.search(pattern1, fixed):
-            fixed = re.sub(pattern1, r'}, \1', fixed)
-            logger.debug("使用激进策略修复了对象/数组之间的逗号")
-        
-        # 模式2: ] 后直接跟 {（数组后跟对象）
-        pattern2 = r'\]\s+(\{)'
-        if re.search(pattern2, fixed):
-            fixed = re.sub(pattern2, r'], \1', fixed)
-            logger.debug("使用激进策略修复了数组和对象之间的逗号")
-        
-        return fixed
-
-    def _fix_special_characters(self, json_str: str) -> str:
-        """
-        修复可能导致JSON解析失败的特殊字符。
-        包括：
-        - 移除或替换不可见字符
-        - 修复常见的Unicode问题
-        - 处理BOM标记
-        """
-        if not json_str or not isinstance(json_str, str):
-            return json_str
-        
-        fixed = json_str
-        
-        # 移除BOM标记
-        if fixed.startswith('\ufeff'):
-            fixed = fixed[1:]
-            logger.debug("移除了BOM标记")
-        
-        # 移除零宽字符（但保留必要的空白）
-        zero_width_chars = ['\u200b', '\u200c', '\u200d', '\ufeff']
-        for char in zero_width_chars:
-            if char in fixed:
-                fixed = fixed.replace(char, '')
-                logger.debug(f"移除了零宽字符: {repr(char)}")
-        
-        # 修复常见的引号问题（但需要谨慎，避免误修复）
-        # 这里只处理明显错误的引号
-        # 注意：不要替换字符串内的引号，只处理结构性的引号问题
-        
-        # 移除控制字符（除了必要的换行符和制表符）
-        import unicodedata
-        # 保留换行符和制表符，移除其他控制字符
-        cleaned_chars = []
-        for char in fixed:
-            if ord(char) < 32:
-                if char in '\n\r\t':
-                    cleaned_chars.append(char)
-                else:
-                    # 移除其他控制字符
-                    logger.debug(f"移除了控制字符: {repr(char)} (U+{ord(char):04X})")
-            else:
-                cleaned_chars.append(char)
-        
-        if len(cleaned_chars) != len(fixed):
-            fixed = ''.join(cleaned_chars)
-            logger.debug("移除了控制字符")
-        
-        return fixed
-
-    def _fix_payment_clause_json_objects(self, item: Dict) -> Dict:
-        """
-        修复payment_clause字段中可能包含的未转义JSON对象。
-        例如: "本协议签后15日内甲方一次性全額支付给乙方，乙方收款后向[ {"warranty": "36个月"}, {"thinking_output": "..."} ]"
-        修复为: "本协议签后15日内甲方一次性全額支付给乙方，乙方收款后向甲方提供有效发票。"
-        """
-        if not isinstance(item, dict):
-            logger.warning(f"_fix_payment_clause_json_objects: item不是字典类型，而是 {type(item)}")
-            return item
-            
-        if "payment_clause" not in item:
-            return item
-        
-        try:
-            payment_clause = item["payment_clause"]
-        except (KeyError, TypeError) as e:
-            logger.error(f"_fix_payment_clause_json_objects: 访问payment_clause时出错: {e}, item类型: {type(item)}, item keys: {list(item.keys()) if isinstance(item, dict) else 'N/A'}")
-            return item
-            
-        if not isinstance(payment_clause, str):
-            return item
-        
-        # 检测并修复payment_clause中的JSON对象
-        # 匹配模式: [ {"key": "value"}, {"key2": "value2"} ]
-        json_object_pattern = r'\[\s*\{[^}]*\}\s*(?:,\s*\{[^}]*\}\s*)*\]'
-        
-        # 查找所有匹配的JSON对象
-        matches = re.findall(json_object_pattern, payment_clause)
-        
-        if matches:
-            logger.warning(f"检测到payment_clause中包含JSON对象: {matches}")
-            
-            # 移除所有JSON对象，只保留纯文本部分
-            cleaned_clause = payment_clause
-            for match in matches:
-                cleaned_clause = cleaned_clause.replace(match, "")
-            
-            # 清理多余的空格和分隔符
-            cleaned_clause = re.sub(r'\s*\|\s*$', '', cleaned_clause)  # 移除末尾的 "|"
-            cleaned_clause = re.sub(r'\s+', ' ', cleaned_clause)  # 合并多个空格
-            cleaned_clause = cleaned_clause.strip()
-            
-            # 更新item
-            item["payment_clause"] = cleaned_clause
-            logger.info(f"修复后的payment_clause: {cleaned_clause}")
-        
-        return item
 
     def _format_rag_examples(self, rag_examples: list, title: str = "RAG参考示例") -> str:
         """
@@ -2145,21 +1265,23 @@ class PaymentSummaryRatioExtractor:
 
     async def verify_single_group_single(self, group_items: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
-        单组去重：对同一 (clause_category, payment_type) 组的 N 个候选条款，
-        由 LLM 挑选一个最合适的 id。单任务单输出，Qwen2.5-9B 友好。
-
-        Args:
-            group_items: 候选条款列表，每项至少含 id/payment_clause/payment_type/clause_category。
+        单组去重 / 类型纠正：对同一 payment_type 组的 N 个候选条款，由 LLM 决策：
+          - select_one  → 真正重复，保留一条，其余丢弃
+          - correct_type → 类型误判（不同 ratio），纠正 payment_type，全部保留
 
         Returns:
-            {"select_clause_id": <id>, "reason": <str>}。
-            LLM 未就绪 / 调用异常 / 解析失败 / 选出的 id 不在候选集合中 → 代码级兜底：按 _pick_best_clause 规则打分选一个。
+            {
+              "action": "select_one" | "correct_type",
+              "select_clause_id": <str|None>,
+              "corrections": [{"id": ..., "corrected_payment_type": ...}, ...],
+              "reason": <str>
+            }
+            LLM 未就绪 / 调用异常 / 解析失败 → 代码级兜底：select_one，按 _pick_best_clause 规则打分选一个。
         """
         candidate_ids = [str(it.get("id", "")) for it in group_items if isinstance(it, dict)]
         candidate_id_set = {cid for cid in candidate_ids if cid}
 
         def _code_fallback(reason: str) -> Dict[str, Any]:
-            # 代码级打分：优先"有动作且有金额/比例"，再按 clause 文本长度
             def _score(it: Dict[str, Any]) -> tuple:
                 clause = str(it.get("payment_clause", "") or "")
                 has_action = bool(re.search(r'支付|付款|汇入|付清', clause))
@@ -2167,17 +1289,21 @@ class PaymentSummaryRatioExtractor:
                 score_action = 2 if (has_action and has_amount) else (1 if has_action else 0)
                 return (score_action, len(clause))
             best = max(group_items, key=_score) if group_items else {}
-            return {"select_clause_id": str(best.get("id", "")), "reason": f"兜底({reason})"}
+            return {
+                "action": "select_one",
+                "select_clause_id": str(best.get("id", "")),
+                "corrections": [],
+                "reason": f"兜底({reason})",
+            }
 
         if not group_items:
-            return {"select_clause_id": "", "reason": "空组"}
+            return {"action": "select_one", "select_clause_id": "", "corrections": [], "reason": "空组"}
         if len(group_items) == 1:
-            return {"select_clause_id": candidate_ids[0], "reason": "单条直通"}
+            return {"action": "select_one", "select_clause_id": candidate_ids[0], "corrections": [], "reason": "单条直通"}
         if not self.is_ready or not getattr(self, "result_verification_single_group_llm_chain", None):
             return _code_fallback("LLM未就绪")
 
         try:
-            # 精简负载，避免过长的 clause_context 等字段影响 9B 注意力
             payload = [
                 {
                     "id": str(it.get("id", "")),
@@ -2188,38 +1314,62 @@ class PaymentSummaryRatioExtractor:
                 }
                 for it in group_items
             ]
-            input_dict = {"group_clauses": json.dumps(payload, ensure_ascii=False)}
+            # 根据 clause_category 注入对应分类的标准节点列表，避免跨分类节点污染
+            category = str(group_items[0].get("clause_category", "") or "") if group_items else ""
+            standard_nodes = INSTALL_STANDARD_NODES_STR if category == "installation_payment" else EQUIPMENT_STANDARD_NODES_STR
+            input_dict = {
+                "group_clauses": json.dumps(payload, ensure_ascii=False),
+                "standard_nodes": standard_nodes,
+            }
             response_obj = await llm_guarded_ainvoke(
                 self.result_verification_single_group_llm_chain, input_dict
             )
             llm_output_str = str(getattr(response_obj, "content", response_obj)).strip()
 
-            # 解析：优先 JSON，失败则兜底
-            cleaned = self._clean_json_string(llm_output_str)
-            # 去除可能的 markdown 代码块
-            m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', cleaned, re.DOTALL | re.IGNORECASE)
-            if m:
-                cleaned = m.group(1).strip()
             try:
-                parsed = json.loads(cleaned)
-            except json.JSONDecodeError:
-                # regex 二次兜底
-                m2 = re.search(r'"select_clause_id"\s*:\s*"([^"]+)"', llm_output_str)
-                if m2 and m2.group(1) in candidate_id_set:
-                    return {"select_clause_id": m2.group(1), "reason": "regex兜底"}
+                parsed = json.loads(llm_output_str.strip())
+            except (json.JSONDecodeError, ValueError):
                 return _code_fallback("JSON解析失败")
 
-            if isinstance(parsed, list) and parsed:
-                parsed = parsed[0]
             if not isinstance(parsed, dict):
                 return _code_fallback("输出结构非法")
 
+            action = str(parsed.get("action", "select_one")).strip()
+
+            if action == "correct_type":
+                corrections_raw = parsed.get("corrections") or []
+                corrections = []
+                for corr in corrections_raw:
+                    if not isinstance(corr, dict):
+                        continue
+                    cid = str(corr.get("id", "")).strip()
+                    new_type = str(corr.get("corrected_payment_type", "")).strip()
+                    if cid in candidate_id_set and new_type:
+                        corrections.append({"id": cid, "corrected_payment_type": new_type})
+                    else:
+                        logger.warning(f"单组去重 correct_type：跳过无效修正项 id={cid}, type={new_type}")
+                if not corrections:
+                    logger.warning(f"单组去重 correct_type：修正列表为空，降级为兜底 select_one")
+                    return _code_fallback("correct_type但corrections为空")
+                return {
+                    "action": "correct_type",
+                    "select_clause_id": None,
+                    "corrections": corrections,
+                    "reason": str(parsed.get("reason", "") or ""),
+                }
+
+            # 默认按 select_one 处理
             selected = str(parsed.get("select_clause_id", "")).strip()
             reason = str(parsed.get("reason", "") or "")
             if selected not in candidate_id_set:
                 logger.warning(f"单组去重：LLM 选出 id={selected} 不在候选 {candidate_ids} 中，代码级兜底")
                 return _code_fallback("LLM选出的id不在候选中")
-            return {"select_clause_id": selected, "reason": reason}
+            return {
+                "action": "select_one",
+                "select_clause_id": selected,
+                "corrections": [],
+                "reason": reason,
+            }
         except Exception as e:
             logger.warning(f"单组去重 LLM 调用异常: {e}，代码级兜底")
             return _code_fallback(f"LLM异常:{type(e).__name__}")
@@ -2287,18 +1437,11 @@ class PaymentSummaryRatioExtractor:
                 },
             )
             raw = str(getattr(response_obj, "content", response_obj)).strip()
-            cleaned = self._clean_json_string(raw)
-
-            data: Optional[Dict[str, Any]] = None
             try:
-                data = json.loads(cleaned)
-            except Exception:
-                m = re.search(r"\{[^{}]*\}", cleaned, flags=re.DOTALL)
-                if m:
-                    try:
-                        data = json.loads(m.group(0))
-                    except Exception:
-                        data = None
+                data: Optional[Dict[str, Any]] = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                logger.warning(f"[timing] JSON 解析失败（schema 约束下不应出现）: {raw[:200]}")
+                return default
             if not isinstance(data, dict):
                 logger.warning(f"[timing] JSON 解析失败，原始输出: {raw[:200]}")
                 return default
@@ -2370,74 +1513,18 @@ class PaymentSummaryRatioExtractor:
 
     def _parse_verification_output(self, llm_output: str) -> Tuple[List[str], str]:
         """
-        解析校验LLM的输出，提取挑选出的ID列表和思考过程。
-        期望的输出格式：
-        [
-          {"select_clause_id": "ID1"},
-          {"select_clause_id": "ID2"},
-          ...,
-          {"thinking_output": "思考过程文本"}
-        ]
+        解析 Chain 6 (VerificationResult) 输出：{"items": [{select_clause_id}], "thinking_output": "..."}
+        返回: (selected_ids, thinking_text)
         """
         try:
-            # 首先尝试提取JSON代码块
-            import re
-
-            # 方法1: 查找```json ... ```代码块
-            json_pattern = r'```(?:json)?\s*\n?(.*?)\n?```'
-            json_match = re.search(json_pattern, llm_output, re.DOTALL | re.IGNORECASE)
-
-            if json_match:
-                json_content = json_match.group(1).strip()
-            else:
-                # 方法2: 如果没有代码块标记，直接查找JSON结构
-                # 查找第一个[或{开始的JSON
-                start_idx = llm_output.find('[')
-                if start_idx == -1:
-                    start_idx = llm_output.find('{')
-                if start_idx >= 0:
-                    json_content = llm_output[start_idx:]
-                else:
-                    json_content = llm_output
-
-            # 清理并解析JSON
-            cleaned_output = self._clean_json_string(json_content)
-
-            # 尝试解析JSON
-            parsed_data = json.loads(cleaned_output)
-
-            if not isinstance(parsed_data, list):
-                logger.error(f"LLM输出不是数组格式: {parsed_data}")
-                return [], ""
-
-            selected_ids = []
-            thinking_text = ""
-
-            # 遍历数组，提取ID和思考过程
-            for item in parsed_data:
-                if isinstance(item, dict):
-                    # 检查是否包含错误信息
-                    if 'error' in item:
-                        logger.warning(f"LLM返回包含错误信息: {item.get('error')}")
-                        continue
-
-                    if "select_clause_id" in item:
-                        # 包含挑选出的条款ID
-                        selected_ids.append(item["select_clause_id"])
-                    elif "thinking_output" in item:
-                        # 包含思考过程
-                        thinking_text = item["thinking_output"]
-
-            logger.info(f"成功解析校验结果: 挑选出 {len(selected_ids)} 个条款ID")
-            return selected_ids, thinking_text
-
-        except json.JSONDecodeError as e:
-            logger.error(f"解析LLM校验输出JSON失败: {e}")
-            logger.error(f"清理后的输出: {cleaned_output if 'cleaned_output' in locals() else '未定义'}")
-            logger.error(f"原始输出: {llm_output}")
-            return [], ""
-        except Exception as e:
-            logger.error(f"解析LLM校验输出时发生错误: {e}")
+            data = json.loads(llm_output.strip())
+            items = data.get("items", []) if isinstance(data, dict) else []
+            thinking_text = data.get("thinking_output", "") if isinstance(data, dict) else ""
+            selected_ids = [item["select_clause_id"] for item in items if isinstance(item, dict) and "select_clause_id" in item]
+            logger.info(f"解析校验结果：挑选出 {len(selected_ids)} 个条款ID")
+            return selected_ids, thinking_text or ""
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            logger.error(f"_parse_verification_output JSON 解析失败: {e}")
             return [], ""
 
     @staticmethod
@@ -2513,92 +1600,32 @@ class PaymentSummaryRatioExtractor:
 
     def _parse_single_clause_validation_output(self, llm_output: str, original_clause: Dict[str, Any]) -> Dict[str, Any]:
         """
-        解析单条条款校验LLM的输出。
-
-        模型可能输出以下几种格式：
-        1. 直接 JSON：{"id": "ID", "is_valid": true/false, "reason": "..."}
-        2. 先思考再 JSON："reason text" → false\n{"id":...}
-        3. 幻觉多条款："reason"\n{"id":"1",...}\n{"id":"2",...}
-
-        策略：提取第一个完整 JSON 对象；若失败则从前置自然语言推断 is_valid。
+        解析 Chain 7 (ClauseValidationResult) 输出：{"id": "...", "is_valid": bool, "reason": "..."}
+        json_schema 强制保证合法 JSON；保留 ID 错位守护业务逻辑。
         """
         try:
-            import re
-
-            cleaned = llm_output.strip()
-
-            # 移除 markdown 代码块
-            cleaned = re.sub(r'^```(?:json)?\s*\n?', '', cleaned, flags=re.MULTILINE)
-            cleaned = re.sub(r'\n?```\s*$', '', cleaned, flags=re.MULTILINE)
-
-            # 处理转义：仅修复双重转义（如 LLM 输出被额外包了一层字符串转义的情况）
-            # 注意：不能替换单层 \" → "，因为这是 JSON 字符串值内部的合法转义
-            cleaned = cleaned.replace('\\\\"', '\\"')
-            cleaned = cleaned.replace('\\n', ' ')
-            cleaned = cleaned.replace('\\t', ' ')
-
-            # 提取第一个完整 JSON 对象（匹配大括号配对）
-            first_brace = cleaned.find('{')
-            if first_brace == -1:
-                # 无 JSON，从自然语言推断
-                return self._infer_validity_from_text(cleaned, original_clause)
-
-            # 从 first_brace 开始，找到第一个配对完整的 '}'
-            depth = 0
-            end_pos = -1
-            for pos in range(first_brace, len(cleaned)):
-                if cleaned[pos] == '{':
-                    depth += 1
-                elif cleaned[pos] == '}':
-                    depth -= 1
-                    if depth == 0:
-                        end_pos = pos
-                        break
-
-            if end_pos == -1:
-                # 找到了 '{' 但没有匹配的 '}'（幻觉续写导致括号不闭合）。
-                # 仅取 '{' 之前的前置文本推断，避免幻觉续写中的 '→ false' 干扰。
-                prefix_text = cleaned[:first_brace]
-                return self._infer_validity_from_text(prefix_text, original_clause)
-
-            json_str = cleaned[first_brace:end_pos + 1]
-
-            parsed_data = None
-            try:
-                parsed_data = json.loads(json_str)
-            except json.JSONDecodeError:
-                # 第一个 JSON 对象解析失败，从前置文本推断
-                prefix_text = cleaned[:first_brace]
-                return self._infer_validity_from_text(prefix_text, original_clause)
-
-            if isinstance(parsed_data, list) and len(parsed_data) > 0:
-                parsed_data = parsed_data[0]
-
+            parsed_data = json.loads(llm_output.strip())
             if not isinstance(parsed_data, dict):
-                return self._infer_validity_from_text(cleaned, original_clause)
+                return self._validation_fallback(original_clause, "输出结构非法")
 
-            # ID错位守护：LLM可能幻觉续写，输出与输入不匹配的id（如输入id=2但输出id=3）。
-            # 检测到错位时，JSON中的is_valid不可信，回退至前置CoT文本推断。
+            # ID 错位守护：LLM 选错 id 时判定为幻觉，回退 fail-open 兜底
             parsed_id = str(parsed_data.get("id", "")).strip()
             original_id = str(original_clause.get("id", "")).strip()
             if parsed_id and original_id and parsed_id != original_id:
                 logger.warning(
-                    f"条款校验ID错位: 输入ID={original_id}, LLM输出ID={parsed_id}, "
-                    f"判定为幻觉续写，回退至CoT推断"
+                    f"条款校验ID错位: 输入ID={original_id}, LLM输出ID={parsed_id}，回退至 fail-open 兜底"
                 )
-                prefix_text = cleaned[:first_brace]
-                return self._infer_validity_from_text(prefix_text, original_clause)
+                return self._validation_fallback(original_clause, f"id_mismatch:{parsed_id}")
 
             return {
                 "id": parsed_data.get("id", original_clause.get("id", "")),
-                "is_valid": bool(parsed_data.get("is_valid", False)),
+                "is_valid": bool(parsed_data.get("is_valid", True)),
                 "reason": parsed_data.get("reason", ""),
                 "text": original_clause.get("clause", ""),
                 "clause_class": original_clause.get("clause_class", ""),
                 "clause_context": original_clause.get("clause_context", ""),
             }
-
-        except Exception as e:
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
             logger.error(f"解析单条条款校验输出失败 ID={original_clause.get('id')}: {e}")
             return self._validation_fallback(original_clause, f"parse_exception: {type(e).__name__}")
 
@@ -2703,42 +1730,15 @@ class PaymentSummaryRatioExtractor:
 
     def _parse_mixed_category_output(self, llm_output: str, clause_id: str) -> Dict[str, Any]:
         """
-        解析归属判定 LLM 输出。
-        期望：{"id": "...", "category": "equipment_payment|installation_payment|both", "reason": "..."}
-        兜底规则：任何异常或非法枚举 → category="equipment_payment"
+        解析 Chain 8 (ClauseCategoryResult) 输出：{"id": "...", "category": enum, "reason": "..."}
+        兜底规则：非法枚举 → category="equipment_payment"
         """
-        import re as _re
-        fallback = {"id": clause_id, "category": "equipment_payment", "reason": "兜底(解析失败或非法枚举)"}
         valid_enum = {"equipment_payment", "installation_payment", "both"}
-
+        fallback = {"id": clause_id, "category": "equipment_payment", "reason": "兜底(解析失败或非法枚举)"}
         try:
-            cleaned = llm_output.strip()
-            cleaned = _re.sub(r'^```(?:json)?\s*\n?', '', cleaned, flags=_re.MULTILINE)
-            cleaned = _re.sub(r'\n?```\s*$', '', cleaned, flags=_re.MULTILINE)
-
-            first_brace = cleaned.find('{')
-            last_brace = cleaned.rfind('}')
-            if first_brace == -1 or last_brace == -1:
-                # 最后一搏：直接在原文找枚举
-                for v in valid_enum:
-                    if v in cleaned:
-                        return {"id": clause_id, "category": v, "reason": "regex-fallback"}
-                return fallback
-
-            json_str = cleaned[first_brace:last_brace + 1]
-            try:
-                parsed = json.loads(json_str)
-            except json.JSONDecodeError:
-                m = _re.search(r'"category"\s*:\s*"(equipment_payment|installation_payment|both)"', json_str)
-                if m:
-                    return {"id": clause_id, "category": m.group(1), "reason": "regex-extract"}
-                return fallback
-
-            if isinstance(parsed, list) and parsed:
-                parsed = parsed[0]
+            parsed = json.loads(llm_output.strip())
             if not isinstance(parsed, dict):
                 return fallback
-
             raw_cat = (parsed.get("category") or "").strip()
             if raw_cat in valid_enum:
                 return {
@@ -2747,7 +1747,7 @@ class PaymentSummaryRatioExtractor:
                     "reason": parsed.get("reason", ""),
                 }
             return fallback
-        except Exception as e:
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
             logger.error(f"解析混签归属输出失败 ID={clause_id}: {e}")
             return fallback
 

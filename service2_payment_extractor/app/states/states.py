@@ -136,3 +136,96 @@ class StateHelper:
         if hasattr(obj, 'model_dump'):
             return obj.model_dump()
         raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+# ========== LLM 结构化输出 Schema 模型（json_schema response_format 专用）==========
+
+class _PaymentRatioNode(BaseModel):
+    """Chain 1/2（equipment_chain / install_chain）单条款初步提取的单个节点"""
+    payment_type: Optional[str] = None
+    ratio: Optional[str] = None
+    amount: Optional[str] = None
+
+
+class PaymentRatioResult(BaseModel):
+    """Chain 1/2 输出包装：equipment_chain / install_chain"""
+    nodes: List[_PaymentRatioNode] = []
+
+
+class _PaymentSummaryNode(BaseModel):
+    """Chain 3/4 批量汇总复审的单个节点"""
+    id: str
+    payment_clause: str
+    payment_type: Optional[str] = None
+    final_ratio: Optional[str] = None
+    final_amount: Optional[str] = None
+
+
+class PaymentSummaryResult(BaseModel):
+    """Chain 3/4 输出包装：llm_chain / install_llm_chain（设备/安装批量汇总复审）"""
+    items: List[_PaymentSummaryNode] = []
+    thinking_output: Optional[str] = None
+
+
+class _WarrantyNode(BaseModel):
+    """Chain 5 质保期提取的单个条目"""
+    warranty: str
+    effective_conditions: str
+    closed_end_conditions: str
+
+
+class WarrantySummaryResult(BaseModel):
+    """Chain 5 输出包装：warranty_llm_chain"""
+    items: List[_WarrantyNode] = []
+    thinking_output: Optional[str] = None
+
+
+class _VerificationSelectItem(BaseModel):
+    """Chain 6 双组去重校验的单个保留节点"""
+    select_clause_id: str
+
+
+class VerificationResult(BaseModel):
+    """Chain 6 输出包装：result_verification_llm_chain"""
+    items: List[_VerificationSelectItem] = []
+    thinking_output: Optional[str] = None
+
+
+class ClauseValidationResult(BaseModel):
+    """Chain 7 输出：clause_validation_llm_chain 单条款有效性验证"""
+    id: str
+    is_valid: bool
+    reason: str
+
+
+class ClauseCategoryResult(BaseModel):
+    """Chain 8 输出：clause_category_llm_chain 混合类型条款分类"""
+    id: str
+    category: Literal["equipment_payment", "installation_payment", "both"]
+    reason: str
+
+
+class _TypeCorrection(BaseModel):
+    """单条类型纠正：将指定 id 的条款 payment_type 修正为 corrected_payment_type"""
+    id: str
+    corrected_payment_type: str
+
+
+class SingleGroupVerificationResult(BaseModel):
+    """Chain 9 输出：result_verification_single_group_llm_chain 单组去重 / 类型纠正
+
+    action:
+      - "select_one"   → 真正重复，从候选中保留一条（select_clause_id 有效，corrections 为空）
+      - "correct_type" → 类型误判，对指定条款修正 payment_type，全部保留（corrections 有效，select_clause_id 为 null）
+    """
+    action: Literal["select_one", "correct_type"]
+    select_clause_id: Optional[str] = None
+    corrections: List[_TypeCorrection] = []
+    reason: str
+
+
+class PaymentTimingResult(BaseModel):
+    """Chain 10 输出：payment_timing_llm_chain 付款时序提取"""
+    payment_days: Optional[int] = None
+    latest_payment_stage: Optional[str] = None
+    latest_payment_date: Optional[int] = None

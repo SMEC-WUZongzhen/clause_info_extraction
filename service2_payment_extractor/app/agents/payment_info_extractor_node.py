@@ -23,6 +23,7 @@ from app.config.env_config import (
     get_dedupe_thresholds,
     normalize_clause_class,
     enforce_install_payment_type,
+    enforce_equipment_payment_type,
     get_negotiation_reject_keywords,
     get_failure_rate_threshold,
 )
@@ -607,6 +608,8 @@ async def _validate_extraction_results(
                     installation_items.append(item)
         
         # 识别设备付款条款中的重复节点
+        # 分组 key = payment_type：同类型不论比例都视为候选重复，交由 LLM 判断是真重复还是类型误判
+        # 注：此处 item 为 PaymentSummaryItem，比例字段为 final_ratio
         equipment_duplicates = []
         equipment_payment_types = {}
         for item in equipment_items:
@@ -620,6 +623,8 @@ async def _validate_extraction_results(
                 equipment_payment_types[payment_type] = item
         
         # 识别安装付款条款中的重复节点
+        # 分组 key = payment_type：同类型不论比例都视为候选重复，交由 LLM 判断是真重复还是类型误判
+        # 注：此处 item 为 PaymentSummaryItem，比例字段为 final_ratio（字符串如 "15%"）
         installation_duplicates = []
         installation_payment_types = {}
         for item in installation_items:
@@ -654,7 +659,10 @@ async def _validate_extraction_results(
         # 3. 按 (clause_category, payment_type) 分组重复节点
         dup_groups: Dict[tuple, List[Any]] = {}
         for item in all_duplicates:
-            group_key = (getattr(item, 'clause_category', ''), getattr(item, 'payment_type', ''))
+            group_key = (
+                getattr(item, 'clause_category', ''),
+                getattr(item, 'payment_type', ''),
+            )
             dup_groups.setdefault(group_key, []).append(item)
 
         logger.info(f"准备按组校验：共 {len(dup_groups)} 个重复组（设备重复 {len(equipment_duplicates)} 条 + 安装重复 {len(installation_duplicates)} 条）")
@@ -679,7 +687,7 @@ async def _validate_extraction_results(
 
         group_results = await asyncio.gather(*group_tasks, return_exceptions=True)
 
-        # 5. 汇总每组的 selected_id，并累计 reason 作为 thinking
+        # 5. 汇总每组的处理结果：select_one（删除） 或 correct_type（纠正类型，全部保留）
         final_result = list(summary_result)
         dedup_removed_ids: set = set()
         thinking_lines: List[str] = []
@@ -692,20 +700,45 @@ async def _validate_extraction_results(
                 logger.warning(f"去重组 {gk} LLM 调用异常: {gr}，交给代码级兜底")
                 continue
 
-            selected_id = (gr or {}).get("select_clause_id", "")
+            action = (gr or {}).get("action", "select_one")
             reason = (gr or {}).get("reason", "")
-            if selected_id not in group_ids:
-                # verify_single_group_single 内部已做兜底，这里一般不会进入；保险再兜一次
-                logger.warning(f"去重组 {gk} 选出 ID={selected_id} 不在组内 {group_ids}，交给代码级兜底")
-                continue
 
-            thinking_lines.append(f"[{gk[0]}|{gk[1]}] 保留 {selected_id}：{reason}")
-            for item in group_items:
-                item_id = getattr(item, 'id', '')
-                if item_id != selected_id and item in final_result:
-                    final_result.remove(item)
-                    dedup_removed_ids.add(item_id)
-                    logger.info(f"去重移除条款 ID={item_id}（组={gk}，保留 {selected_id}）")
+            if action == "correct_type":
+                # 类型误判：纠正 payment_type，全部保留
+                corrections = (gr or {}).get("corrections") or []
+                for corr in corrections:
+                    cid = str(corr.get("id", "")).strip()
+                    new_type = str(corr.get("corrected_payment_type", "")).strip()
+                    if not cid or not new_type or cid not in group_ids:
+                        logger.warning(f"去重组 {gk} correct_type 修正项无效: id={cid}, new_type={new_type}，跳过")
+                        continue
+                    for i, item in enumerate(final_result):
+                        if getattr(item, 'id', '') == cid:
+                            old_type = getattr(item, 'payment_type', '')
+                            try:
+                                final_result[i] = item.model_copy(update={"payment_type": new_type})
+                                logger.info(f"纠正条款类型 ID={cid}: {old_type} → {new_type}")
+                            except Exception as e:
+                                logger.warning(f"纠正类型 model_copy 失败 ID={cid}: {e}")
+                            break
+                thinking_lines.append(f"[{gk[0]}|{gk[1]}] 类型纠正：{reason}")
+
+            elif action == "select_one":
+                # 真正重复：保留一条，移除其余
+                selected_id = (gr or {}).get("select_clause_id", "")
+                if selected_id not in group_ids:
+                    logger.warning(f"去重组 {gk} 选出 ID={selected_id} 不在组内 {group_ids}，交给代码级兜底")
+                    continue
+                thinking_lines.append(f"[{gk[0]}|{gk[1]}] 保留 {selected_id}：{reason}")
+                for item in group_items:
+                    item_id = getattr(item, 'id', '')
+                    if item_id != selected_id and item in final_result:
+                        final_result.remove(item)
+                        dedup_removed_ids.add(item_id)
+                        logger.info(f"去重移除条款 ID={item_id}（组={gk}，保留 {selected_id}）")
+
+            else:
+                logger.warning(f"去重组 {gk} LLM 返回未知 action={action}，交给代码级兜底")
 
         # 6. 组装 thinking_info（兼容原返回结构）
         validated_thinking_info = thinking_info
@@ -847,6 +880,11 @@ async def _process_single_payment_paragraph(
             node_payment_type = node.get("payment_type") or rag_payment_type
             node_ratio = node.get("ratio")
             node_amount = node.get("amount")
+            # 单位规整：将 "40.46万元" / "5万" 等转换为纯数字字符串（不含单位）
+            if node_amount is not None:
+                _amt_float = PaymentRatioExtractor._parse_amount_to_float(node_amount)
+                if _amt_float is not None:
+                    node_amount = str(int(_amt_float)) if _amt_float == int(_amt_float) else str(_amt_float)
             # 硬规则兜底：辅助费目（保养费/指导费等）+ 无显式比例 → 强制清空 ratio
             if node_ratio is not None and _should_strip_ratio(clause_text):
                 logger.info(
@@ -1692,6 +1730,21 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
                             f"(item_id={item_id}, clause={safe_clause(initial_item.get('payment_clause'))})"
                         )
 
+                # 设备侧 payment_type 白名单兜底：防止安装专属节点（如"进场前（首付）"）混入设备结果
+                elif clause_category == "equipment_payment":
+                    _normalized_pt_eq, _pt_action_eq = enforce_equipment_payment_type(final_payment_type)
+                    if _pt_action_eq == "dropped":
+                        logger.warning(
+                            f"{_NODE_TAG} 设备侧 payment_type 不在白名单，已丢弃（疑似节点泄露）: "
+                            f"'{final_payment_type}' (item_id={item_id})"
+                        )
+                        continue
+                    elif _pt_action_eq == "missing":
+                        logger.warning(
+                            f"{_NODE_TAG} 设备侧 payment_type 字段缺失，保留节点 "
+                            f"(item_id={item_id}, clause={safe_clause(initial_item.get('payment_clause'))})"
+                        )
+
                 # 硬规则兜底：辅助费目（保养费/指导费等）+ 无显式比例 → 强制清空 ratio
                 final_ratio_val: Optional[float] = round(ratio_val, 4) if ratio_val is not None else None
                 if _should_strip_ratio(initial_item.get('payment_clause', '')):
@@ -1799,6 +1852,19 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
                     # H4 修复：恢复路径同样区分 missing 与 dropped；缺字段不丢节点
                     logger.warning(
                         f"{_NODE_TAG} 恢复分支安装侧 payment_type 缺失，保留节点 (key={key})"
+                    )
+
+            # 设备侧 payment_type 白名单兜底（恢复分支）
+            elif clause_category == "equipment_payment":
+                _normalized_pt_eq, _pt_action_eq = enforce_equipment_payment_type(orig_type)
+                if _pt_action_eq == "dropped":
+                    logger.warning(
+                        f"{_NODE_TAG} 跳过恢复 key={key}：设备侧 payment_type 不在白名单（疑似节点泄露）'{orig_type}'"
+                    )
+                    continue
+                elif _pt_action_eq == "missing":
+                    logger.warning(
+                        f"{_NODE_TAG} 恢复分支设备侧 payment_type 缺失，保留节点 (key={key})"
                     )
 
             # 跳过同 category 下已存在相同 payment_type 的条款（LLM 已有意去重）

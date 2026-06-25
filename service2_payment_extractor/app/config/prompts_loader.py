@@ -271,3 +271,17 @@ PAYMENT_CLAUSE_VALIDATION_PROMPT = _LOADED["PAYMENT_CLAUSE_VALIDATION_PROMPT"]
 PAYMENT_CLAUSE_CATEGORY_PROMPT = _LOADED["PAYMENT_CLAUSE_CATEGORY_PROMPT"]
 RESULT_VERIFICATION_SINGLE_GROUP_PROMPT = _LOADED["RESULT_VERIFICATION_SINGLE_GROUP_PROMPT"]
 PAYMENT_TIMING_EXTRACTION_PROMPT = _LOADED["PAYMENT_TIMING_EXTRACTION_PROMPT"]
+
+# 设备 / 安装标准节点字符串，供 verify_single_group_single 按 clause_category 动态注入，
+# 保证每次 LLM 调用只看到本组对应的节点列表，避免跨组污染。
+# 优先从 BusinessDict 构建（与提取 prompt 保持一致），失败时回退到 prompts.py 兜底常量。
+try:
+    from app.config.business_dict import get_business_dict as _gbd_for_nodes
+    _bd_for_nodes = _gbd_for_nodes()
+    EQUIPMENT_STANDARD_NODES_STR, INSTALL_STANDARD_NODES_STR = _build_node_list_from_business_dict(_bd_for_nodes)
+    del _bd_for_nodes, _gbd_for_nodes
+except Exception:
+    import app.config.prompts as _p_fallback
+    EQUIPMENT_STANDARD_NODES_STR = _p_fallback._EQUIPMENT_STANDARD_NODES
+    INSTALL_STANDARD_NODES_STR = _p_fallback._INSTALL_STANDARD_NODES
+    del _p_fallback

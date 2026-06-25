@@ -73,7 +73,26 @@ def enforce_install_payment_type(payment_type: Optional[str]) -> Tuple[Optional[
     return pt, "dropped"
 
 
-# --- 兼容性懒代理：旧调用方 from app.config.env_config import INSTALL_PAYMENT_TYPE_WHITELIST ---
+def enforce_equipment_payment_type(payment_type: Optional[str]) -> Tuple[Optional[str], str]:
+    """对设备侧 payment_type 做白名单校验兜底，防止安装专属节点混入设备结果。
+
+    返回 (normalized_payment_type, action)，action ∈ {"kept", "missing", "dropped"}：
+    - "kept"    : 已在设备白名单内，原样保留
+    - "missing" : 输入为 None / 空字符串，调用方应保留节点本体并记录 WARNING
+    - "dropped" : 不在设备白名单（如安装侧节点"进场前（首付）"等），调用方应丢弃该节点
+    """
+    if payment_type is None:
+        return None, "missing"
+    pt = str(payment_type).strip()
+    if not pt:
+        return None, "missing"
+    equip_whitelist = get_business_dict().equipment.payment_type_whitelist
+    if pt in equip_whitelist:
+        return pt, "kept"
+    return pt, "dropped"
+
+
+
 _DEPRECATED_NAMES = {
     "INSTALL_PAYMENT_TYPE_WHITELIST",
     "INSTALL_PAYMENT_TYPE_CROSS_MAPPING",

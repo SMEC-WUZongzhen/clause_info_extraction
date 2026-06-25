@@ -35,7 +35,7 @@ SERVICE1_CONFIG = {
 # ===== Service 2（付款信息提取）=====
 # 两套预设：本地开发 / 百舸远程生产
 SERVICE2_LOCAL_CONFIG = {
-    "base_url": _env("SERVICE2_LOCAL_BASE_URL", "http://localhost:8001"),
+    "base_url": _env("SERVICE2_LOCAL_BASE_URL", "http://localhost:8002"),
     "endpoint": _env("SERVICE2_ENDPOINT", "/extract_payment_info"),
     "api_key": "",  # 本地无需认证
     "timeout": _env("SERVICE2_TIMEOUT", 600),
