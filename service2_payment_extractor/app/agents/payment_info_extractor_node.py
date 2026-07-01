@@ -113,7 +113,12 @@ def _should_force_valid(clause: Optional[str], clause_class: Optional[List[str]]
             haystack = text + " | " + " ".join(str(c) for c in clause_class)
         except Exception:
             haystack = text
-    if any(kw in haystack for kw in fv.exclude_keywords):
+    # "无利息"是质保金条款的常见描述（质保金不计息），不构成利息类排除
+    effective_exclude = [
+        kw for kw in fv.exclude_keywords
+        if not (kw == "利息" and "无利息" in text)
+    ]
+    if any(kw in haystack for kw in effective_exclude):
         return False
 
     # 双向窗口扫描：先找出所有"百分比"出现位置，再判断是否有节点关键词在 ±gap 字符内
@@ -989,6 +994,45 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
         f"{_NODE_TAG} 接收到 {len(all_paragraphs)} 个段落，"
         f"其中 payment={len(payment_paragraphs)}, warranty={len(warranty_paragraphs)}"
     )
+
+    # ---- 质保金条款救赎：Service 1 可能将"质量保证金"付款条款误分类为"质保期条款"，
+    #      导致质保金节点被路由到质保期提取分支而绕过付款条款校验。
+    #      检测 warranty_paragraphs 中同时含"质量保证金/质保金"+ 具体比例/金额的条款，
+    #      将其移回 payment_paragraphs。 ----
+    _DEPOSIT_RESCUE_KEYWORDS = ("质量保证金", "质保金")
+    _rescued_paras = []
+    _remaining_warranty = []
+    for para in warranty_paragraphs:
+        clause_text = (para.clause or "").strip()
+        has_deposit_kw = any(kw in clause_text for kw in _DEPOSIT_RESCUE_KEYWORDS)
+        has_pct = bool(re.search(r"\d+(\.\d+)?\s*[%％]", clause_text))
+        has_amount = bool(re.search(r"[¥￥]?\d[\d,，.]*\s*元", clause_text))
+        if has_deposit_kw and (has_pct or has_amount):
+            # 根据内容判断设备/安装/混签
+            if "设备" in clause_text and "安装" not in clause_text:
+                new_class = "设备付款条款"
+            elif "安装" in clause_text and "设备" not in clause_text:
+                new_class = "安装付款条款"
+            else:
+                new_class = "混签付款条款"
+            updated_class = [c for c in para.clause_class if c != "质保期条款"]
+            if new_class not in updated_class:
+                updated_class.append(new_class)
+            para.clause_class = updated_class
+            _rescued_paras.append(para)
+            logger.info(
+                f"{_NODE_TAG} 质保金条款救赎: 从质保期移回付款, "
+                f"new_class={new_class}, 条款={safe_clause(clause_text, head=80)}"
+            )
+        else:
+            _remaining_warranty.append(para)
+    if _rescued_paras:
+        warranty_paragraphs = _remaining_warranty
+        payment_paragraphs.extend(_rescued_paras)
+        logger.success(
+            f"{_NODE_TAG} 质保金条款救赎完成: 移回 {len(_rescued_paras)} 条, "
+            f"剩余质保期 {len(warranty_paragraphs)} 条"
+        )
 
     # ---- 关键词预过滤（直接过滤 payment_paragraphs，不可被后续异常绕过） ----
     _INVALID_KEYWORDS = get_clause_filter_keywords()
