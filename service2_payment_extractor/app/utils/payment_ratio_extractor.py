@@ -14,6 +14,7 @@ from app.states.states import (
     PaymentRatioResult, PaymentSummaryResult, WarrantySummaryResult,
     VerificationResult, ClauseValidationResult, ClauseCategoryResult,
     SingleGroupVerificationResult, PaymentTimingResult,
+    RatioCorrectionResult,
 )
 from typing import Optional, List, Union, Tuple, Dict, Any
 from app.config.prompts_loader import (
@@ -28,6 +29,8 @@ from app.config.prompts_loader import (
     PAYMENT_CLAUSE_VALIDATION_PROMPT,
     PAYMENT_CLAUSE_CATEGORY_PROMPT,
     PAYMENT_TIMING_EXTRACTION_PROMPT,
+    RATIO_CORRECTION_UNDER_PROMPT,
+    RATIO_CORRECTION_OVER_PROMPT,
     EQUIPMENT_STANDARD_NODES_STR,
     INSTALL_STANDARD_NODES_STR,
 )
@@ -589,9 +592,22 @@ class PaymentRatioExtractor:
             re.search(r'\d[\d,，.]*\s*(万元|万|元)', text)
             or re.search(r'[¥￥]\s*\d', text)
         )
+        _implicit_full_keywords = ("一次性付款",)
+        has_implicit_full = any(kw in text for kw in _implicit_full_keywords)
+
+        logger.debug(
+            f"[ratio_constraint] pct={has_pct_token} residual={has_residual} "
+            f"amount={has_explicit_amount} implicit_full={has_implicit_full} "
+            f"clause={text.strip()[:60]}"
+        )
 
         # 放行条件：有显式 % 或（有余款语义 且 无显式金额）
         if has_pct_token or (has_residual and not has_explicit_amount):
+            return payment_nodes
+
+        # 放行条件：隐含全额支付（原文含"无预付款""无进度款""一次性付款"等措辞，
+        # 提示词已指导 LLM 输出 ratio=100%，属于可信推导而非幻觉）
+        if has_implicit_full:
             return payment_nodes
 
         for node in payment_nodes:
@@ -711,6 +727,16 @@ class PaymentSummaryRatioExtractor:
                 max_retries=_LLM_MAX_RETRIES,
             )
 
+            # 比例矫正专用 LLM：输出含完整 JSON + thinking_output，需要更大 max_tokens
+            _correction_max_tokens = int(os.getenv("RATIO_CORRECTION_LLM_MAX_TOKENS", "4096"))
+            llm_correction = ChatOpenAI(
+                model=model_identifier, temperature=temperature,
+                openai_api_key=llm_config.api_key or "EMPTY", openai_api_base=llm_config.api_base,
+                max_tokens=_correction_max_tokens,
+                request_timeout=_LLM_REQUEST_TIMEOUT_SEC,
+                max_retries=_LLM_MAX_RETRIES,
+            )
+
             prompt_template = PromptTemplate(template=PAYMENT_SUMMARY_RATIO_PROMPT, input_variables=["batch_payment_items", "chunk_text_map","rag_examples"])
             install_prompt_template = PromptTemplate(template=INSTALL_PAYMENT_SUMMARY_RATIO_PROMPT, input_variables=["batch_payment_items", "chunk_text_map","rag_examples"])
             warranty_prompt_template = PromptTemplate(template=WARRANTY_SUMMARY, input_variables=["warranty_clauses"])
@@ -740,6 +766,19 @@ class PaymentSummaryRatioExtractor:
             self.clause_category_llm_chain = clause_category_prompt_template | llm.bind(response_format=_cat_fmt)
             self.result_verification_single_group_llm_chain = result_verification_single_group_prompt_template | llm.bind(response_format=_sg_fmt)
             self.payment_timing_llm_chain = payment_timing_prompt_template | llm.bind(response_format=_timing_fmt)
+
+            # Chain 11/12: 比例求和矫正
+            ratio_correction_under_template = PromptTemplate(
+                template=RATIO_CORRECTION_UNDER_PROMPT,
+                input_variables=["batch_items", "merged_context", "actual_sum", "category_desc"],
+            )
+            ratio_correction_over_template = PromptTemplate(
+                template=RATIO_CORRECTION_OVER_PROMPT,
+                input_variables=["batch_items", "merged_context", "actual_sum", "category_desc"],
+            )
+            _correction_fmt = _make_json_schema_format("ratio_correction_result", RatioCorrectionResult)
+            self.ratio_correction_under_chain = ratio_correction_under_template | llm_correction.bind(response_format=_correction_fmt)
+            self.ratio_correction_over_chain = ratio_correction_over_template | llm_correction.bind(response_format=_correction_fmt)
 
             # 记录最终生效的 LLM 配置（用于 _should_reinitialize 比对）
             self.current_llm_config = {
@@ -1511,6 +1550,67 @@ class PaymentSummaryRatioExtractor:
             return default
 
 
+    async def correct_ratio_sum(
+        self,
+        batch_items: str,
+        merged_context: str,
+        actual_sum: float,
+        category_desc: str = "",
+    ) -> Tuple[List[Dict], Optional[str]]:
+        """Chain 11/12: 比例求和矫正。
+
+        Args:
+            batch_items: 当前组所有节点 JSON 字符串
+            merged_context: 合并后的合同上下文文本
+            actual_sum: 当前比例和（0-1 浮点数）
+            category_desc: 分类描述（如"设备"/"安装"），用于 prompt 上下文
+
+        Returns:
+            (矫正后节点 dict 列表, thinking_output)
+            异常时返回 ([], None)
+        """
+        if not self.is_ready:
+            logger.warning("[ratio_correction] PaymentSummaryRatioExtractor 未就绪，返回空")
+            return [], None
+
+        is_under = actual_sum < 1.0
+        chain = self.ratio_correction_under_chain if is_under else self.ratio_correction_over_chain
+        actual_sum_pct = f"{actual_sum * 100:.1f}"
+
+        input_dict = {
+            "batch_items": batch_items,
+            "merged_context": merged_context or "(无上下文)",
+            "actual_sum": actual_sum_pct,
+            "category_desc": category_desc or "",
+        }
+
+        try:
+            response_obj = await llm_guarded_ainvoke(chain, input_dict)
+        except Exception as e:
+            logger.error(f"[ratio_correction] LLM 调用失败: {e}", exc_info=True)
+            return [], None
+
+        raw_output_str = str(getattr(response_obj, "content", response_obj)).strip()
+
+        try:
+            result = RatioCorrectionResult.model_validate_json(raw_output_str)
+        except Exception:
+            # 降级：尝试从 JSON 字符串提取
+            try:
+                data = json.loads(raw_output_str)
+                result = RatioCorrectionResult.model_validate(data)
+            except Exception as e2:
+                logger.error(f"[ratio_correction] 输出解析失败: {e2}, raw={raw_output_str[:300]}")
+                return [], None
+
+        items = [item.model_dump() for item in result.items]
+        logger.info(
+            f"[ratio_correction] {'不足' if is_under else '超出'}100% 矫正完成: "
+            f"输入比例和={actual_sum_pct}%, 返回 {len(items)} 个节点"
+        )
+        return items, None
+
+
     def _parse_verification_output(self, llm_output: str) -> Tuple[List[str], str]:
         """
         解析 Chain 6 (VerificationResult) 输出：{"items": [{select_clause_id}], "thinking_output": "..."}
@@ -1707,6 +1807,21 @@ class PaymentSummaryRatioExtractor:
             ctx_raw = ctx_raw[:300] + "..." + ctx_raw[-300:]
 
         fallback = {"id": clause_id, "category": "equipment_payment", "reason": "兜底(分类器未就绪或解析失败)"}
+
+        # 代码级前置判定：条款以设备/安装标题开头时直接分类，跳过 LLM
+        # 避免 9B 模型被"合同结算金额"等 both 主体词误导，忽略标题限定规则
+        clause_text = (clause.get("clause", "") or "").strip()
+        if clause_text:
+            _EQUIP_TITLES = ("设备采购", "设备款支付", "设备付款", "设备费用支付", "设备购置", "设备费支付", "设备货款")
+            _INSTALL_TITLES = ("安装费支付", "安装款支付", "安装付款", "安装费用支付", "安装工程费支付", "安装费结算")
+            for kw in _EQUIP_TITLES:
+                if clause_text.startswith(kw):
+                    logger.info(f"混签归属代码级判定→equipment ID={clause_id}（标题'{kw}'）")
+                    return {"id": clause_id, "category": "equipment_payment", "reason": f"标题限定({kw})"}
+            for kw in _INSTALL_TITLES:
+                if clause_text.startswith(kw):
+                    logger.info(f"混签归属代码级判定→installation ID={clause_id}（标题'{kw}'）")
+                    return {"id": clause_id, "category": "installation_payment", "reason": f"标题限定({kw})"}
 
         if not self.is_ready or not getattr(self, "clause_category_llm_chain", None):
             logger.error(f"混签归属判定器未就绪，兜底→equipment ID={clause_id}")

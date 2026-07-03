@@ -11,7 +11,7 @@
 |---|---|
 | `clause_category` | `equipment_payment` 或 `installation_payment` |
 | `payment_type` | 标准节点名称（经映射表转换） |
-| `payment_code` | 节点编码（如 `EARNEST`、`Z004`） |
+| `payment_code` | 节点编码（如 `EARNEST`、`COMPACCEPT`） |
 | `payment_ratio` | 付款比例（百分比） |
 | `payment_amount` | 付款金额 |
 | `payment_clause` | 条款原文 |

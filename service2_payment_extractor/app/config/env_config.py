@@ -404,3 +404,22 @@ def get_negotiation_reject_keywords() -> List[str]:
             return []
     keywords = [kw.strip() for kw in raw.split(',') if kw.strip()]
     return keywords
+
+
+@lru_cache(maxsize=1)
+def get_ratio_sum_tolerance() -> float:
+    """比例求和校验容差（默认 0.01 = 1%）。
+
+    |sum - 1.0| ≤ 容差时直接微调最后节点，不调 LLM；
+    超出容差时调用 LLM 矫正。
+    """
+    raw = _get("RATIO_SUM_TOLERANCE")
+    if raw is None or str(raw).strip() == "":
+        return 0.01
+    try:
+        v = float(raw)
+        if 0.0 <= v <= 0.1:
+            return v
+    except (TypeError, ValueError):
+        pass
+    return 0.01

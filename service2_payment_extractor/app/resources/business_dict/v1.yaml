@@ -139,21 +139,21 @@ equipment:
     - { source: "销售定金",            code: "EARNEST",    name: "合同定金" }
     - { source: "预付款",              code: "DEPOSIT",    name: "预付款" }
     - { source: "提货款",              code: "WITHDRAWAL", name: "提货款" }
-    - { source: null,                  code: "Z001",       name: "到货前" }
-    - { source: "货到工地",            code: "Z002",       name: "货到工地" }
-    - { source: "安装后",              code: "Z003",       name: "安装后" }
-    - { source: "公司验收后",          code: "Z004",       name: "公司验收后" }
-    - { source: "当地政府部门验收后",   code: "Z005",       name: "当地政府部门验收后" }
-    - { source: "结算完成",            code: "Z020",       name: "结算完成后" }
-    - { source: "特殊约定付款-移交前",  code: "Z024",       name: "特殊约定付款-移交前" }
-    - { source: "电梯移交用户后",       code: "Z016",       name: "电梯移交用户后" }
-    - { source: "特殊约定付款-移交后",  code: "Z011",       name: "特殊约定付款-移交后" }
-    - { source: "工程整体竣工",         code: "Z017",       name: "工程整体竣工" }
-    - { source: "质保金",              code: "Z023",       name: "质保金1年" }
-    - { source: null,                  code: "Z006",       name: "质保金2年" }
-    - { source: null,                  code: "Z025",       name: "特殊约定付款-质保期" }
-    - { source: null,                  code: "Z021",       name: "保理发票" }
-    - { source: null,                  code: "Z022",       name: "保理应收" }
+    - { source: null,                  code: "TOPART",       name: "到货前" }
+    - { source: "货到工地",            code: "TOPLANT",       name: "货到工地" }
+    - { source: "安装后",              code: "INSTFINISH",       name: "安装后" }
+    - { source: "公司验收后",          code: "COMPACCEPT",       name: "公司验收后" }
+    - { source: "当地政府部门验收后",   code: "GOVACCEPT",       name: "当地政府部门验收后" }
+    - { source: "结算完成",            code: "SETTLEMENT",       name: "结算完成后" }
+    - { source: "特殊约定付款-移交前",  code: "SPECIAL2",       name: "特殊约定付款-移交前" }
+    - { source: "电梯移交用户后",       code: "CUSTACCEPT",       name: "电梯移交用户后" }
+    - { source: "特殊约定付款-移交后",  code: "SPECIAL1",       name: "特殊约定付款-移交后" }
+    - { source: "工程整体竣工",         code: "PROJFINISH",       name: "工程整体竣工后" }
+    - { source: "质保金",              code: "RETENTION2",       name: "质保金1年" }
+    - { source: null,                  code: "RETENTION",       name: "质保金2年" }
+    - { source: null,                  code: "SPECIAL3",       name: "特殊约定付款-质保期" }
+    - { source: null,                  code: "FACTORING_INVOICE",       name: "保理发票" }
+    - { source: null,                  code: "FACTORING_RECEIVABLE",       name: "保理应收" }
 
 # --- 安装侧节点白名单与跨类映射（H6/H7） ---
 install:
@@ -185,22 +185,22 @@ install:
     "特殊付款—移交后": "特殊付款-移交后"
   # 安装标准节点映射表（来自 节点映射.xlsx 安装 sheet）
   payment_type_mapping:
-    - { source: "定金",                code: "Z018",        name: "安装定金" }
-    - { source: "进场前（首付）",      code: "DOWNPAYMENT", name: "进场前" }
-    - { source: "进场后",              code: "Z027",        name: "进场开工后" }
-    - { source: null,                  code: "Z003",        name: "安装后" }
-    - { source: "报验前",              code: "Z019",        name: "报验前" }
-    - { source: "公司验收后",          code: "Z004",        name: "公司验收后" }
-    - { source: "当地政府部门验收后",   code: "Z005",        name: "当地政府部门验收后" }
-    - { source: null,                  code: "Z020",        name: "结算完成后" }
-    - { source: "移交前",              code: "Z028",        name: "移交前" }
-    - { source: "特殊付款-移交前",     code: "Z024",        name: "特殊约定付款-移交前" }
-    - { source: "电梯移交用户后",       code: "Z016",        name: "电梯移交用户后" }
-    - { source: "特殊付款-移交后",     code: "Z011",        name: "特殊约定付款-移交后" }
-    - { source: "工程整体竣工",         code: "Z017",        name: "工程整体竣工" }
-    - { source: "质保金",              code: "Z023",        name: "质保金1年" }
-    - { source: null,                  code: "Z006",        name: "质保金2年" }
-    - { source: null,                  code: "Z025",        name: "特殊约定付款-质保期" }
+    - { source: "定金",                code: "PREPAY",        name: "安装定金" }
+    - { source: "进场前（首付）",      code: "DOWNPAYMENT", name: "安装队进场开工前" }
+    - { source: "进场后",              code: "AFTERPAYMENT7",        name: "进场开工后" }
+    - { source: null,                  code: "AFTERINSTALL",        name: "安装后" }
+    - { source: "报验前",              code: "PREINSPEC",        name: "报验前" }
+    - { source: "公司验收后",          code: "COMPACCEPT",        name: "公司验收后" }
+    - { source: "当地政府部门验收后",   code: "GOVACCEPT",        name: "当地政府部门验收后" }
+    - { source: null,                  code: "SETTLEMENT",        name: "结算完成后" }
+    - { source: "移交前",              code: "BEFORETRANSFER",        name: "移交前" }
+    - { source: "特殊付款-移交前",     code: "SPECIAL2",        name: "特殊约定付款-移交前" }
+    - { source: "电梯移交用户后",       code: "CUSTACCEPT",        name: "电梯移交用户后" }
+    - { source: "特殊付款-移交后",     code: "SPECIAL1",        name: "特殊约定付款-移交后" }
+    - { source: "工程整体竣工",         code: "PROJFINISH",        name: "工程整体竣工后" }
+    - { source: "质保金",              code: "RETENTION1",        name: "质保金1年" }
+    - { source: null,                  code: "RETENTION",        name: "质保金2年" }
+    - { source: null,                  code: "SPECIAL3",        name: "特殊约定付款-质保期" }
 
 # --- payment_type 正则降级表（H9） ---
 # 仅在 PaymentRatioExtractor JSON 解析三级降级失败时使用；保留以观察命中率，

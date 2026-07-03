@@ -1,6 +1,7 @@
 # app/agents/payment_info_extractor_node.py
 
 import asyncio
+import os
 from collections import Counter
 from typing import Dict, Any, Optional, List, Tuple, Set
 from loguru import logger
@@ -26,6 +27,7 @@ from app.config.env_config import (
     enforce_equipment_payment_type,
     get_negotiation_reject_keywords,
     get_failure_rate_threshold,
+    get_ratio_sum_tolerance,
 )
 from app.config.business_dict import get_business_dict
 from app.utils.debug_helper import DebugHelper
@@ -41,6 +43,84 @@ def _calculate_similarity(text1: str, text2: str) -> float:
     计算两个字符串的相似度，返回0-1之间的值
     """
     return SequenceMatcher(None, text1, text2).ratio()
+
+
+def _is_multi_node_summary_clause(text: Optional[str]) -> bool:
+    """判断是否为包含多付款节点的汇总型条款/表格行。"""
+    if not text:
+        return False
+    stripped = str(text).strip()
+    if not stripped:
+        return False
+
+    pct_matches = re.findall(r"\d+(?:\.\d+)?\s*[%％]", stripped)
+    if len(pct_matches) < 3:
+        return False
+
+    has_table_marker = stripped.startswith('|') and stripped.count('|') >= 3
+    sequence_hits = re.findall(r"(?:\(\d+\)|\b\d+[\.、])", stripped)
+    payment_hits = re.findall(r"支付至|累计至|支付|付款|付清|验收后|发货前|货到|提货", stripped)
+
+    return has_table_marker or len(sequence_hits) >= 2 or len(payment_hits) >= 2
+
+
+def _filter_redundant_summary_paragraphs(payment_paragraphs: List[Paragraph]) -> List[Paragraph]:
+    """在进入抽取前跳过已被多个同类别原子条款覆盖的汇总行。"""
+    if len(payment_paragraphs) <= 1:
+        return payment_paragraphs
+
+    def _categories(para: Paragraph) -> Set[str]:
+        cats: Set[str] = set()
+        for raw in para.clause_class or []:
+            raw_text = str(raw).strip()
+            canonical = normalize_clause_class(raw_text)
+            candidate = canonical or raw_text
+            if candidate in ("equipment_payment", "设备付款条款"):
+                cats.add("equipment_payment")
+            elif candidate in ("installation_payment", "安装付款条款"):
+                cats.add("installation_payment")
+        return cats
+
+    summary_indices: List[int] = []
+    atomic_indices: List[int] = []
+    para_categories: Dict[int, Set[str]] = {}
+    for idx, para in enumerate(payment_paragraphs):
+        clause_text = (para.clause or "").strip()
+        para_categories[idx] = _categories(para)
+        is_summary = bool(para.metadata.get("is_table_summary")) or _is_multi_node_summary_clause(clause_text)
+        if is_summary:
+            para.metadata["is_table_summary"] = True
+            summary_indices.append(idx)
+        else:
+            atomic_indices.append(idx)
+
+    if not summary_indices or not atomic_indices:
+        return payment_paragraphs
+
+    skip_indices: Set[int] = set()
+    for idx in summary_indices:
+        summary_text = (payment_paragraphs[idx].clause or "").strip()
+        summary_categories = para_categories.get(idx) or set()
+        covered_count = 0
+        for atomic_idx in atomic_indices:
+            atomic_categories = para_categories.get(atomic_idx) or set()
+            if summary_categories and atomic_categories and not (summary_categories & atomic_categories):
+                continue
+            atomic_text = (payment_paragraphs[atomic_idx].clause or "").strip()
+            if not atomic_text:
+                continue
+            if atomic_text in summary_text or _calculate_similarity(atomic_text, summary_text) >= 0.6:
+                covered_count += 1
+        if covered_count >= 2:
+            skip_indices.add(idx)
+            logger.info(
+                f"{_NODE_TAG} 跳过冗余汇总行：已被 {covered_count} 个同类别原子条款覆盖，"
+                f"条款={safe_clause(summary_text, head=80)}"
+            )
+
+    if not skip_indices:
+        return payment_paragraphs
+    return [para for idx, para in enumerate(payment_paragraphs) if idx not in skip_indices]
 
 
 # === 比例反算硬规则兜底 ===
@@ -496,8 +576,14 @@ def _remove_duplicate_payment_items(payment_items: List[Dict[str, Any]], similar
                     # text2 有证据，保留 text2
                     keep_i = False
                 else:
-                    # 都有或都无证据时，保留较长的
-                    keep_i = len(text1) >= len(text2)
+                    # 都有或都无证据时：汇总行 vs 原子条款场景优先保留原子条款，其余保持原逻辑
+                    text1_is_summary = _is_multi_node_summary_clause(text1)
+                    text2_is_summary = _is_multi_node_summary_clause(text2)
+                    if text1_is_summary != text2_is_summary:
+                        keep_i = not text1_is_summary
+                        logger.info("  策略: 汇总行 vs 原子条款，优先保留原子条款")
+                    else:
+                        keep_i = len(text1) >= len(text2)
 
                 if keep_i:
                     to_remove.add(j)
@@ -578,6 +664,180 @@ def _pick_best_clause(candidates: List[PaymentInfo]) -> Optional[PaymentInfo]:
         return (score_action, score_len)
 
     return max(candidates, key=_score)
+
+
+def _dedupe_after_cross_mapping(final_payment_infos: List[PaymentInfo]) -> List[PaymentInfo]:
+    """
+    跨类映射后补充去重：确保同一 (clause_category, payment_type) 只保留一个节点。
+
+    enforce_install_payment_type 在 Stage 8 将"提货款"等映射为"进场前（首付）"后，
+    可能与已有的同类型节点产生重复。_enforce_unique_payment_type 在 Stage 7 执行，
+    操作的是映射前的类型，无法捕获此类重复。
+
+    合并策略：
+    - 同源条款（payment_clause 文本相似度 ≥ 0.9）：LLM 从同一条款拆出多节点，
+      保留 ratio 较小者（差额值优先于累计原始值）
+    - 异源条款：保留 payment_clause 文本较长者（信息更完整）
+    """
+    if len(final_payment_infos) <= 1:
+        return final_payment_infos
+
+    # 按 (clause_category, payment_type) 分组
+    groups: Dict[tuple, List[int]] = {}
+    for idx, info in enumerate(final_payment_infos):
+        category = getattr(info, 'clause_category', None)
+        ptype = getattr(info, 'payment_type', None)
+        if category and ptype:
+            key = (category, ptype)
+            groups.setdefault(key, []).append(idx)
+
+    remove_indices: set = set()
+
+    for key, indices in groups.items():
+        if len(indices) <= 1:
+            continue
+
+        category, ptype = key
+        # 判断同源：payment_clause 文本相似度
+        same_source_groups: Dict[int, List[int]] = {}  # 以第一个成员 idx 为 key
+        unmatched: List[int] = []
+
+        for i in indices:
+            if i in remove_indices:
+                continue
+            clause_i = str(getattr(final_payment_infos[i], 'payment_clause', '') or '')
+            matched_group = None
+            for grp_key, grp_members in same_source_groups.items():
+                ref_clause = str(getattr(final_payment_infos[grp_key], 'payment_clause', '') or '')
+                sim = SequenceMatcher(None, clause_i, ref_clause).ratio()
+                if sim >= 0.9:
+                    matched_group = grp_key
+                    break
+            if matched_group is not None:
+                same_source_groups[matched_group].append(i)
+            else:
+                same_source_groups[i] = [i]
+
+        # 同源去重：保留 ratio 较小者
+        for grp_key, members in same_source_groups.items():
+            if len(members) <= 1:
+                continue
+
+            def _get_ratio(info):
+                r = getattr(info, 'payment_ratio', None)
+                return r if r is not None else float('inf')
+
+            best_idx = min(members, key=lambda i: _get_ratio(final_payment_infos[i]))
+            removed = set(members) - {best_idx}
+            remove_indices.update(removed)
+            logger.warning(
+                f"{_NODE_TAG} 跨类映射后同源去重: "
+                f"category={category}, type={ptype}, "
+                f"保留 ratio={_get_ratio(final_payment_infos[best_idx])}, "
+                f"移除 {len(removed)} 个重复节点"
+            )
+
+    # 如果同源去重已消除所有重复，跳过异源去重
+    remaining_check = [(idx, info) for idx, info in enumerate(final_payment_infos) if idx not in remove_indices]
+    groups2: Dict[tuple, List[tuple]] = {}
+    for idx, info in remaining_check:
+        category = getattr(info, 'clause_category', None)
+        ptype = getattr(info, 'payment_type', None)
+        if category and ptype:
+            key = (category, ptype)
+            groups2.setdefault(key, []).append((idx, info))
+
+    for key, items in groups2.items():
+        if len(items) <= 1:
+            continue
+        # 异源：保留 clause 文本较长者
+        best_idx, _ = max(items, key=lambda x: len(str(getattr(x[1], 'payment_clause', '') or '')))
+        for idx, _ in items:
+            if idx != best_idx:
+                remove_indices.add(idx)
+                logger.warning(
+                    f"{_NODE_TAG} 跨类映射后异源去重: "
+                    f"category={key[0]}, type={key[1]}, 保留 idx={best_idx}, 移除 idx={idx}"
+                )
+
+    if not remove_indices:
+        return final_payment_infos
+
+    result = [info for idx, info in enumerate(final_payment_infos) if idx not in remove_indices]
+    logger.info(
+        f"{_NODE_TAG} 跨类映射后去重完成: "
+        f"移除 {len(remove_indices)} 个重复节点，剩余 {len(result)} 个"
+    )
+    return result
+
+
+def _parse_clause_order(clause: str) -> float:
+    """从条款文本前缀解析序号（如 '3.1xxx' → 3.1），用于排序。无法解析时返回 9999。"""
+    if not clause:
+        return 9999.0
+    m = re.match(r'^\s*(\d+(?:\.\d+)?)', str(clause))
+    if m:
+        return float(m.group(1))
+    return 9999.0
+
+
+def _recompute_cumulative_ratios(payment_infos: List[PaymentInfo]) -> List[PaymentInfo]:
+    """
+    对"支付至X%"类型条款重算差额比例。
+
+    并行提取时 LLM 可能用错误的前序累计值计算差额（如用30%代替60%）。
+    此函数按条款顺序重新维护前序累计，将"支付至X%"的 ratio 修正为 X% - prior_cumulative。
+
+    仅修正正则匹配到"支付至/付至/达到X%"且重算值合理（0 < ratio <= 1.0）的节点。
+    """
+    if len(payment_infos) <= 1:
+        return payment_infos
+
+    # 按类别分组
+    by_category: Dict[str, List[tuple]] = {}
+    for idx, info in enumerate(payment_infos):
+        cat = getattr(info, 'clause_category', None)
+        if cat:
+            by_category.setdefault(cat, []).append((idx, info))
+
+    cumulative_re = re.compile(
+        r'支付(?:至|达到|到)\s*(?:合同总价(?:款)?的\s*)?(\d+(?:\.\d+)?)\s*[%％]'
+    )
+
+    for category, items in by_category.items():
+        # 按条款前缀序号排序
+        sorted_items = sorted(items, key=lambda x: _parse_clause_order(
+            str(getattr(x[1], 'payment_clause', '') or '')
+        ))
+
+        prior_cumulative = 0.0
+        for idx, info in sorted_items:
+            clause = str(getattr(info, 'payment_clause', '') or '')
+            match = cumulative_re.search(clause)
+
+            current_ratio = getattr(info, 'payment_ratio', None)
+            if current_ratio is not None:
+                current_ratio = float(current_ratio)
+
+            if match and current_ratio is not None:
+                target_pct = float(match.group(1)) / 100.0
+                expected_ratio = round(target_pct - prior_cumulative, 4)
+
+                # 仅当重算值合理且与原值差异显著时才修正
+                if 0 < expected_ratio <= 1.0 and abs(expected_ratio - current_ratio) > 0.001:
+                    logger.info(
+                        f"{_NODE_TAG} 累计比例重算: "
+                        f"clause={clause[:40]}..., "
+                        f"原ratio={current_ratio}, 目标={target_pct}, "
+                        f"前序累计={prior_cumulative}, 重算ratio={expected_ratio}"
+                    )
+                    info.payment_ratio = expected_ratio
+                    current_ratio = expected_ratio
+
+            if current_ratio is not None:
+                prior_cumulative += current_ratio
+
+    return payment_infos
 
 
 async def _validate_extraction_results(
@@ -767,6 +1027,243 @@ async def _validate_extraction_results(
         logger.warning("校验失败，对原始结果执行代码级强制去重后返回")
         return _enforce_unique_payment_type(summary_result), thinking_info, set()
 
+
+async def _check_and_correct_ratio_sum(
+    payment_infos: List[PaymentInfo],
+    state: State,
+    chunk_text_map: Dict[str, str],
+    is_debug_mode: bool = False,
+) -> List[PaymentInfo]:
+    """阶段 8.5: 比例求和校验与矫正。
+
+    按 clause_category 分组，检查每组 payment_ratio 之和是否为 100%。
+    - 组内任一 ratio 为 None → 跳过该组
+    - |sum - 1.0| ≤ 容差 → 微调最后节点
+    - 超出容差 → 调用 LLM 矫正（不足/超出两种 prompt）
+    - 矫正后最终微调确保 = 100%
+    """
+    _enabled = os.getenv("SERVICE2_RATIO_SUM_CORRECTION", "true").strip().lower()
+    if _enabled not in ("1", "true", "yes", "on"):
+        logger.info(f"{_NODE_TAG} 比例求和校验已关闭 (SERVICE2_RATIO_SUM_CORRECTION)")
+        return payment_infos
+
+    if not payment_infos:
+        return payment_infos
+
+    tolerance = get_ratio_sum_tolerance()
+
+    # 按 clause_category 分组，保留原始索引
+    groups: Dict[str, List[Tuple[int, PaymentInfo]]] = {}
+    for idx, info in enumerate(payment_infos):
+        cat = info.clause_category or "equipment_payment"
+        groups.setdefault(cat, []).append((idx, info))
+
+    removed_indices: Set[int] = set()
+    new_infos: List[PaymentInfo] = []
+    category_desc_map = {"equipment_payment": "设备", "installation_payment": "安装"}
+
+    for category, indexed_items in groups.items():
+        if not indexed_items:
+            continue
+
+        items = [info for _, info in indexed_items]
+
+        # 组内任一 ratio 为 None → 跳过该组
+        if any(info.payment_ratio is None for info in items):
+            logger.info(f"{_NODE_TAG} 比例求和({category}): 存在 None ratio，跳过该组")
+            continue
+
+        actual_sum = sum(info.payment_ratio or 0.0 for info in items)
+        diff = abs(actual_sum - 1.0)
+
+        if diff <= tolerance:
+            # 容差内：微调最后节点（保证不为负）
+            if diff > 0.001:
+                last = items[-1]
+                old_r = last.payment_ratio
+                new_r = round(old_r + (1.0 - actual_sum), 4)
+                if new_r < 0:
+                    logger.warning(
+                        f"{_NODE_TAG} 比例微调({category}): sum={actual_sum:.4f}, "
+                        f"微调后 ratio={new_r:.4f} 为负，跳过微调保持原值"
+                    )
+                else:
+                    last.payment_ratio = new_r
+                    logger.info(
+                        f"{_NODE_TAG} 比例微调({category}): sum={actual_sum:.4f}, "
+                        f"最后节点 {last.payment_type} ratio {old_r:.4f}→{last.payment_ratio:.4f}"
+                    )
+            else:
+                logger.debug(f"{_NODE_TAG} 比例求和({category}): sum={actual_sum:.4f} 在容差内")
+            continue
+
+        # 超出容差：需要 LLM 矫正
+        logger.warning(
+            f"{_NODE_TAG} 比例求和({category}): sum={actual_sum:.4f}, "
+            f"偏离 1.0 超容差 {tolerance}，启动 LLM 矫正"
+        )
+
+        try:
+            summary_extractor = await get_summary_extractor(state.get("llm_config"))
+
+            # 构造 batch_items JSON
+            batch_list = []
+            for i, info in enumerate(items):
+                batch_list.append({
+                    "id": f"{category[0]}_{i}",
+                    "payment_type": info.payment_type,
+                    "final_ratio": f"{round(info.payment_ratio * 100, 2)}%" if info.payment_ratio is not None else None,
+                    "payment_clause": info.payment_clause,
+                })
+            batch_items_str = json.dumps(batch_list, ensure_ascii=False)
+
+            chunks_key = "equipment_chunks" if category == "equipment_payment" else "installation_chunks"
+            merged_context = chunk_text_map.get(chunks_key, "")
+
+            correction_items, _thinking = await summary_extractor.correct_ratio_sum(
+                batch_items=batch_items_str,
+                merged_context=merged_context,
+                actual_sum=actual_sum,
+                category_desc=category_desc_map.get(category, ""),
+            )
+
+            if not correction_items:
+                logger.warning(f"{_NODE_TAG} 比例矫正({category}): LLM 返回空列表，保持原样")
+                continue
+
+            # 保存原始 ratio 快照 + 本组 removed 索引，用于矫正失败时回退
+            orig_ratios: Dict[int, Optional[float]] = {}
+            cat_removed_indices: Set[int] = set()
+            category_new_infos: List[PaymentInfo] = []
+            for orig_idx, info in indexed_items:
+                orig_ratios[orig_idx] = info.payment_ratio
+
+            def _rollback_category_changes() -> None:
+                removed_indices.difference_update(cat_removed_indices)
+                if category_new_infos:
+                    new_infos[:] = [ni for ni in new_infos if ni not in category_new_infos]
+                for orig_idx, info in indexed_items:
+                    if orig_idx in orig_ratios:
+                        info.payment_ratio = orig_ratios[orig_idx]
+
+            # 构建 id → PaymentInfo 映射
+            id_to_info: Dict[str, PaymentInfo] = {}
+            for i, (orig_idx, info) in enumerate(indexed_items):
+                id_to_info[f"{category[0]}_{i}"] = info
+
+            try:
+                for corr in correction_items:
+                    corr_id = corr.get("id")
+                    action = (corr.get("action") or "kept").strip().lower()
+                    final_ratio_str = corr.get("final_ratio")
+
+                    # 解析比例
+                    ratio_val: Optional[float] = None
+                    if final_ratio_str and str(final_ratio_str).strip().lower() not in ("none", "null", ""):
+                        try:
+                            ratio_val = float(str(final_ratio_str).replace("%", "").strip()) / 100.0
+                        except (ValueError, TypeError):
+                            pass
+
+                    if action == "removed":
+                        if corr_id and corr_id in id_to_info:
+                            # 标记移除：找到原始索引
+                            for orig_idx, info in indexed_items:
+                                if info is id_to_info[corr_id]:
+                                    removed_indices.add(orig_idx)
+                                    cat_removed_indices.add(orig_idx)
+                                    logger.info(
+                                        f"{_NODE_TAG} 比例矫正({category}): 移除节点 "
+                                        f"{id_to_info[corr_id].payment_type} (id={corr_id})"
+                                    )
+                                    break
+                        continue
+
+                    if action == "new":
+                        pt = corr.get("payment_type") or ""
+                        clause = corr.get("payment_clause") or ""
+                        if not pt or not clause:
+                            logger.warning(f"{_NODE_TAG} 比例矫正({category}): 新节点缺少 payment_type 或 payment_clause，跳过")
+                            continue
+                        # 白名单校验
+                        if category == "installation_payment":
+                            pt, pt_action = enforce_install_payment_type(pt)
+                            if pt_action == "dropped":
+                                logger.warning(f"{_NODE_TAG} 比例矫正({category}): 新节点 payment_type='{corr.get('payment_type')}' 不在安装白名单，丢弃")
+                                continue
+                        else:
+                            pt, pt_action = enforce_equipment_payment_type(pt)
+                            if pt_action == "dropped":
+                                logger.warning(f"{_NODE_TAG} 比例矫正({category}): 新节点 payment_type='{corr.get('payment_type')}' 不在设备白名单，丢弃")
+                                continue
+                        new_info = PaymentInfo(
+                            clause_category=category,
+                            payment_clause=clause,
+                            payment_context="",
+                            payment_type=pt,
+                            payment_ratio=round(ratio_val, 4) if ratio_val is not None else None,
+                            payment_amount=None,
+                        )
+                        new_infos.append(new_info)
+                        category_new_infos.append(new_info)
+                        logger.info(
+                            f"{_NODE_TAG} 比例矫正({category}): 新增节点 {pt} ratio={ratio_val}"
+                        )
+                        continue
+
+                    # kept 或 corrected：更新 ratio
+                    if corr_id and corr_id in id_to_info:
+                        info = id_to_info[corr_id]
+                        if ratio_val is not None:
+                            old_r = info.payment_ratio
+                            info.payment_ratio = round(ratio_val, 4)
+                            if action == "corrected":
+                                logger.info(
+                                    f"{_NODE_TAG} 比例矫正({category}): {info.payment_type} "
+                                    f"ratio {old_r:.4f}→{info.payment_ratio:.4f}"
+                                )
+            except Exception:
+                _rollback_category_changes()
+                raise
+
+            # 矫正后校验：若矫正后仍不满足 100%（容差外），直接回退放弃本次矫正
+            surviving = [info for idx, info in indexed_items if idx not in removed_indices]
+            surviving.extend(category_new_infos)
+            if surviving and all(info.payment_ratio is not None for info in surviving):
+                post_sum = sum(info.payment_ratio for info in surviving)
+                if abs(post_sum - 1.0) > tolerance:
+                    logger.warning(
+                        f"{_NODE_TAG} 比例矫正({category})后 sum={post_sum:.4f} ≠ 100%，"
+                        f"回退放弃矫正，保持原始结果(sum={actual_sum:.4f})"
+                    )
+                    _rollback_category_changes()
+                    surviving = [info for idx, info in indexed_items if idx not in removed_indices]
+
+            logger.success(
+                f"{_NODE_TAG} 比例矫正({category})完成: 矫正前 sum={actual_sum:.4f}, "
+                f"矫正后 sum={sum(info.payment_ratio or 0 for info in surviving):.4f}, "
+                f"节点数={len(surviving)}"
+            )
+
+        except Exception as e:
+            logger.error(f"{_NODE_TAG} 比例矫正({category})异常: {e}", exc_info=True)
+
+    # 重建 payment_infos：排除被移除的，追加新增的
+    if removed_indices or new_infos:
+        result = [info for idx, info in enumerate(payment_infos) if idx not in removed_indices]
+        result.extend(new_infos)
+    else:
+        result = payment_infos
+
+    # 所有节点比例必须为非负值
+    for info in result:
+        if info.payment_ratio is not None and info.payment_ratio < 0:
+            logger.warning(
+                f"{_NODE_TAG} 比例负值修正: {info.payment_type} ratio={info.payment_ratio} → 0"
+            )
+            info.payment_ratio = 0.0
+
+    return result
 
 
 async def _process_single_payment_paragraph(
@@ -1150,6 +1647,10 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
     if prefilter_count > 0:
         logger.info(f"代码预过滤：跳过 {prefilter_count} 条非自然语言/空条款（表格行/分隔线/备注等）")
     payment_paragraphs = _kept_paragraphs
+    for para in payment_paragraphs:
+        clause_text = (para.clause or "").strip()
+        if _is_multi_node_summary_clause(clause_text):
+            para.metadata["is_table_summary"] = True
 
     # 第二步：构造待校验列表（id 与 payment_paragraphs 的下标一一对应）
     clauses_to_validate = []
@@ -1390,6 +1891,8 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
                 logger.warning(f"{_NODE_TAG} 未能单独提取到质保期信息")
         except Exception as inner_e:
             logger.error(f"{_NODE_TAG} 调用 extract_summary_warranty 时发生错误: {inner_e}", exc_info=True)
+
+    payment_paragraphs = _filter_redundant_summary_paragraphs(payment_paragraphs)
 
     # 如果没有支付段落，直接返回（保留原始返回格式）
     if not payment_paragraphs:
@@ -1964,8 +2467,24 @@ async def payment_info_extractor_node(state: State, config: Optional[RunnableCon
             except Exception as e:
                 logger.error(f"  恢复条款 key={key} 时创建 PaymentInfo 失败: {e}")
 
+    # === 跨类映射后补充去重 ===
+    # enforce_install_payment_type 在 Stage 8 将"提货款"等映射为"进场前（首付）"后，
+    # 可能与已有的同类型节点产生重复（_enforce_unique_payment_type 在 Stage 7 执行，
+    # 操作的是映射前的类型，无法捕获此类重复）。
+    final_payment_infos = _dedupe_after_cross_mapping(final_payment_infos)
+
+    # === 累计比例差额重算 ===
+    # 并行提取时 LLM 可能用错误的前序累计值计算差额，此处按条款顺序重新维护前序累计，
+    # 将"支付至X%"的 ratio 修正为 X% - prior_cumulative。
+    final_payment_infos = _recompute_cumulative_ratios(final_payment_infos)
+
     # 复核结果后处理：算术校核（amount == 上下文唯一总价 → 100%）+ 零节点清理（ratio==0 且 amount==0 → 删除）
     final_payment_infos = _postprocess_final_payment_infos(final_payment_infos)
+
+    # ========== 阶段 8.5: 比例求和校验与矫正 ==========
+    final_payment_infos = await _check_and_correct_ratio_sum(
+        final_payment_infos, state, chunk_text_map, is_debug_mode
+    )
 
     # ==================== Stage 7：付款时效 LLM 提取 + 特殊条款汇总 ====================
     logger.info(f"{_NODE_TAG} 开始执行 Stage 7：付款时效提取与特殊条款汇总...")

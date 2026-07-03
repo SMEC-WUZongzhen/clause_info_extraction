@@ -229,3 +229,17 @@ class PaymentTimingResult(BaseModel):
     payment_days: Optional[int] = None
     latest_payment_stage: Optional[str] = None
     latest_payment_date: Optional[int] = None
+
+
+class _RatioCorrectionNode(BaseModel):
+    """Chain 11/12 输出：比例矫正后的单个节点"""
+    id: Optional[str] = None              # 已有节点保留原 id；新节点为 null
+    payment_type: Optional[str] = None
+    final_ratio: Optional[str] = None     # 百分比字符串如 "30%"
+    payment_clause: Optional[str] = None  # 新增节点的条款原文
+    action: Optional[str] = "kept"        # kept / corrected / new / removed
+
+
+class RatioCorrectionResult(BaseModel):
+    """Chain 11/12 输出包装：ratio_correction_under/over_chain"""
+    items: List[_RatioCorrectionNode] = []

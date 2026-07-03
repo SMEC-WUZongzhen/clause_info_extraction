@@ -29,42 +29,42 @@
 | EARNEST | 合同定金 |
 | DEPOSIT | 预付款 |
 | WITHDRAWAL | 提货款 |
-| Z001 | 到货前 |
-| Z002 | 货到工地 |
-| Z003 | 安装后 |
-| Z004 | 公司验收后 |
-| Z005 | 当地政府部门验收后 |
-| Z020 | 结算完成后 |
-| Z024 | 特殊约定付款-移交前 |
-| Z016 | 电梯移交用户后 |
-| Z011 | 特殊约定付款-移交后 |
-| Z017 | 工程整体竣工 |
-| Z023 | 质保金1年 |
-| Z006 | 质保金2年 |
-| Z025 | 特殊约定付款-质保期 |
-| Z021 | 保理发票 |
-| Z022 | 保理应收 |
+| TOPART | 到货前 |
+| TOPLANT | 货到工地 |
+| INSTFINISH | 安装后 |
+| COMPACCEPT | 公司验收后 |
+| GOVACCEPT | 当地政府部门验收后 |
+| SETTLEMENT | 结算完成后 |
+| SPECIAL2 | 特殊约定付款-移交前 |
+| CUSTACCEPT | 电梯移交用户后 |
+| SPECIAL1 | 特殊约定付款-移交后 |
+| PROJFINISH | 工程整体竣工后 |
+| RETENTION2 | 质保金1年 |
+| RETENTION | 质保金2年 |
+| SPECIAL3 | 特殊约定付款-质保期 |
+| FACTORING_INVOICE | 保理发票 |
+| FACTORING_RECEIVABLE | 保理应收 |
 
 ### 安装付款节点
 
 | payment_code | 标准节点名（payment_type） |
 |---|---|
-| Z018 | 安装定金 |
-| DOWNPAYMENT | 进场前 |
-| Z027 | 进场开工后 |
-| Z003 | 安装后 |
-| Z019 | 报验前 |
-| Z004 | 公司验收后 |
-| Z005 | 当地政府部门验收后 |
-| Z020 | 结算完成后 |
-| Z028 | 移交前 |
-| Z024 | 特殊约定付款-移交前 |
-| Z016 | 电梯移交用户后 |
-| Z011 | 特殊约定付款-移交后 |
-| Z017 | 工程整体竣工 |
-| Z023 | 质保金1年 |
-| Z006 | 质保金2年 |
-| Z025 | 特殊约定付款-质保期 |
+| PREPAY | 安装定金 |
+| DOWNPAYMENT | 安装队进场开工前 |
+| AFTERPAYMENT7 | 进场开工后 |
+| AFTERINSTALL | 安装后 |
+| PREINSPEC | 报验前 |
+| COMPACCEPT | 公司验收后 |
+| GOVACCEPT | 当地政府部门验收后 |
+| SETTLEMENT | 结算完成后 |
+| BEFORETRANSFER | 移交前 |
+| SPECIAL2 | 特殊约定付款-移交前 |
+| CUSTACCEPT | 电梯移交用户后 |
+| SPECIAL1 | 特殊约定付款-移交后 |
+| PROJFINISH | 工程整体竣工后 |
+| RETENTION1 | 质保金1年 |
+| RETENTION | 质保金2年 |
+| SPECIAL3 | 特殊约定付款-质保期 |
 
 ---
 
@@ -265,7 +265,7 @@ curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/extract_payment_info \
       "payment_clause": "设备到货验收合格后，买方支付合同总价款的60%。",
       "payment_context": "第五条 付款方式\n5.1 合同签订后7日内，买方支付合同总价款的30%作为预付款。\n5.2 设备到货验收合格后，支付合同总价款的60%。",
       "payment_type": "公司验收后",
-      "payment_code": "Z004",
+      "payment_code": "COMPACCEPT",
       "payment_ratio": 60.0,
       "payment_amount": null,
       "payment_days": null,
@@ -306,7 +306,7 @@ curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/extract_payment_info \
       "payment_clause": "货物安装调试完成后支付至合同总价款的90%。",
       "payment_context": "第四条 付款条款\n4.1 合同签订后3日内，甲方支付合同价款的20%作为定金。\n4.2 货物安装调试完成后支付至合同总价款的90%。\n4.3 质保期满无质量问题后，支付剩余10%质保金。",
       "payment_type": "公司验收后",
-      "payment_code": "Z004",
+      "payment_code": "COMPACCEPT",
       "payment_ratio": 90.0,
       "payment_amount": null,
       "payment_days": null,
@@ -318,7 +318,7 @@ curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/extract_payment_info \
   "correct_payments": [
     {
       "payment_type": "公司验收后",
-      "payment_code": "Z004",
+      "payment_code": "COMPACCEPT",
       "payment_ratio": 90.0,
       "payment_amount": null,
       "source": "AI提取",
@@ -441,7 +441,7 @@ curl -X POST http://10.204.2.103/s-r644699c4b7c/8000/extract_payment_info \
 | `payment_clause` | string | 付款条款原文片段 |
 | `payment_context` | string | 付款条款所在段落的完整上下文（对应输入的 `clause_context`） |
 | `payment_type` | string | 付款类型（**标准节点名称**，参见下方"标准节点映射表"） |
-| `payment_code` | string/null | 付款节点编码（与 `payment_type` 对应，如 `EARNEST`、`Z023`） |
+| `payment_code` | string/null | 付款节点编码（与 `payment_type` 对应，如 `EARNEST`、`RETENTION2`） |
 | `payment_ratio` | float/null | 付款比例（百分比） |
 | `payment_amount` | string/null | 付款金额 |
 | `payment_days` | int/null | 付款天数（自付款触发条件起的常规周期天数） |
@@ -957,7 +957,7 @@ F1 = 2 × (精确率 × 召回率) / (精确率 + 召回率)
 
 - 若 LLM 输出的内部节点未命中映射表，`payment_type` 回退为原名，`payment_code` 为 `null`。
 - `correct_payments` / `missed_payments` / `false_payments` 中的 `payment_type` 同样经过映射（GT 来源的名称未命中时保持 GT 原名）。
-- 标记为"保留节点"的标准节点（如 Z001 到货前、Z006 质保金2年、Z021 保理发票、Z022 保理应收、Z025 特殊约定付款-质保期）当前内部白名单无对应输出，仅作为标准节点保留在配置中，便于后续扩展。
+- 标记为"保留节点"的标准节点（如 TOPART 到货前、RETENTION 质保金2年、FACTORING_INVOICE 保理发票、FACTORING_RECEIVABLE 保理应收、SPECIAL3 特殊约定付款-质保期）当前内部白名单无对应输出，仅作为标准节点保留在配置中，便于后续扩展。
 
 ---
 
@@ -965,6 +965,7 @@ F1 = 2 × (精确率 × 召回率) / (精确率 + 召回率)
 
 | 版本 | 日期 | 变更说明 |
 |------|------|----------|
+| **v1.9.0** | 2026-07 | **Breaking**：标准节点编码（`payment_code`）全面更新，与业务词典 `v1.yaml` 的 `payment_type_mapping` 对齐。设备侧 Z 系列编码替换为语义化编码（如 `Z004`→`COMPACCEPT`、`Z001`→`TOPART`、`Z023`→`RETENTION2`）；安装侧同步更新（如 `Z018`→`PREPAY`、`Z027`→`AFTERPAYMENT7`、`Z028`→`BEFORETRANSFER`）。安装侧 `进场前（首付）` 输出名由 `进场前` 改为 `安装队进场开工前`；设备/安装 `工程整体竣工` 输出名改为 `工程整体竣工后`。映射表详见 `app/resources/business_dict/v1.yaml`。 |
 | **v1.8.3** | 2026-06 | `special_clause_content` 字段由文档级统一汇总改为按 `clause_category` 分类拼装：设备付款节点仅包含设备类条款文本，安装付款节点仅包含安装类条款文本。字段类型不变（`string/null`），对外无破坏性变更。 |
 | **v1.8.2** | 2026-06 | `/compare_contract_price` 的 `sis_contract_price` 改为可选：未传或为 `null` 时仅做 LLM 抽取，不进行比对，响应中 `comparison_result` 返回 `null`、`sis_contract_price` 也回带 `null`。已传值时行为与 v1.8.1 完全一致。 |
 | **v1.8.1** | 2026-06 | **Breaking**: `analyze` 模式请求字段 `gt_payment_stages` 重命名为 `sis_payment_stages`；422 错误信息中的 `loc` 同步更新；其余字段语义、归一化规则与响应结构保持不变。客户端需同步替换字段名，旧字段不再兼容。 |

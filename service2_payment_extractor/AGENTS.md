@@ -195,6 +195,7 @@ special_clause_content: str   # 特殊条款汇总（Stage 7）
 | `ClauseCategoryResult` | 混签归属判定 | Chain 8 |
 | `SingleGroupVerificationResult` | 单组去重/类型纠正 | Chain 9 |
 | `PaymentTimingResult` | 付款时效提取 | Chain 10 |
+| `RatioCorrectionResult` | 比例求和矫正 | Chain 11/12 |
 
 ---
 
@@ -291,6 +292,19 @@ special_clause_content: str   # 特殊条款汇总（Stage 7）
 - **未匹配条款恢复**：LLM 未处理的条款用初步提取结果兜底恢复（跳过已去重/已存在的）
 - **算术校核**：原文无 % 且 amount == 上下文唯一总价 → 强制 ratio=1.0
 - **零金额/空壳清理**：amount=0 或 ratio+amount 均无值 → 丢弃
+
+### 阶段 8.5：比例求和校验与矫正（LLM Chain 11/12）
+
+`_check_and_correct_ratio_sum`：
+1. **分组求和**：按 clause_category 分组，统计每组 `payment_ratio` 之和
+2. **None 跳过**：组内任一 ratio 为 None → 跳过该组（合同条款可能无比例描述）
+3. **容差微调**：|sum - 1.0| ≤ `RATIO_SUM_TOLERANCE`（默认 1%）→ 直接微调最后节点
+4. **LLM 矫正**：超出容差时调用 LLM，分两种 prompt：
+   - 比例不足 100% → `RATIO_CORRECTION_UNDER_PROMPT`（Chain 11）：从上下文捞漏掉节点
+   - 比例超出 100% → `RATIO_CORRECTION_OVER_PROMPT`（Chain 12）：识别多余节点/比例错误
+5. **矫正应用**：kept/corrected 更新 ratio、new 创建新 PaymentInfo（白名单校验）、removed 移除节点
+6. **最终微调**：矫正后若仍≠100%，调整最后节点强制=1.0
+7. **功能开关**：`SERVICE2_RATIO_SUM_CORRECTION=false` 可关闭本阶段
 
 ### 阶段 9：付款时效提取 + 特殊条款汇总（LLM Chain 10，progress=85）
 
@@ -403,6 +417,8 @@ prompts.py 内嵌常量（兜底）
 | `PAYMENT_CLAUSE_CATEGORY_PROMPT` | 混签归属判定（Chain 8） |
 | `RESULT_VERIFICATION_SINGLE_GROUP_PROMPT` | 单组去重/类型纠正（Chain 9） |
 | `PAYMENT_TIMING_EXTRACTION_PROMPT` | 付款时效提取（Chain 10） |
+| `RATIO_CORRECTION_UNDER_PROMPT` | 比例不足100%矫正（Chain 11） |
+| `RATIO_CORRECTION_OVER_PROMPT` | 比例超出100%矫正（Chain 12） |
 | `CONTRACT_PRICE_EXTRACTION_PROMPT` | 合同金额抽取（`/compare_contract_price`） |
 
 ---
@@ -475,6 +491,8 @@ AppSettings (config_models.py)
 | `EXTRACTION_FAILURE_RATE_THRESHOLD` | 0.5 | 失败率阈值（超限返回 503） |
 | `DEDUPE_*` | 见 .env.example | 去重/合并阈值 |
 | `CLAUSE_FILTER_KEYWORDS` | 违约金,罚款,赔偿损失 | 预过滤关键词 |
+| `SERVICE2_RATIO_SUM_CORRECTION` | true | 比例求和校验矫正开关 |
+| `RATIO_SUM_TOLERANCE` | 0.01 | 比例求和容差（1%）；容差内微调最后节点，超容差调 LLM |
 | `BM25_REQUIRE_HASH` | 0 | pickle sha256 校验（prod 建议 1） |
 
 完整列表见 `.env.example`。
